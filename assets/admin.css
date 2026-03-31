@@ -1,0 +1,851 @@
+/* Numos R2 Media Offload - Admin Styles */
+
+/* ==========================================================================
+   Design Tokens
+   ========================================================================== */
+
+:root {
+    /* Colors - Primary */
+    --numos-primary: #2271b1;
+    --numos-primary-hover: #135e96;
+    --numos-primary-light: #e7f3ff;
+
+    /* Colors - Status */
+    --numos-success: #10b981;
+    --numos-success-bg: #d1fae5;
+    --numos-success-text: #065f46;
+    --numos-error: #ef4444;
+    --numos-error-bg: #fee2e2;
+    --numos-error-text: #991b1b;
+    --numos-warning: #f59e0b;
+    --numos-warning-bg: #fef3c7;
+    --numos-warning-text: #92400e;
+    --numos-info: #3b82f6;
+    --numos-info-bg: #dbeafe;
+    --numos-info-text: #1e40af;
+
+    /* Colors - Neutral */
+    --numos-bg: #fff;
+    --numos-bg-secondary: #f0f0f1;
+    --numos-border: #c3c4c7;
+    --numos-border-light: #dcdcde;
+    --numos-text: #1d2327;
+    --numos-text-muted: #646970;
+    --numos-text-light: #8c8f96;
+
+    /* Spacing */
+    --numos-space-xs: 4px;
+    --numos-space-sm: 8px;
+    --numos-space-md: 12px;
+    --numos-space-lg: 20px;
+    --numos-space-xl: 32px;
+
+    /* Border Radius */
+    --numos-radius-sm: 4px;
+    --numos-radius-md: 6px;
+    --numos-radius-lg: 8px;
+
+    /* Shadows */
+    --numos-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+    --numos-shadow-md: 0 1px 3px rgba(0, 0, 0, 0.1);
+
+    /* Transitions */
+    --numos-transition: 150ms ease-in-out;
+}
+
+/* ==========================================================================
+   Base Layout
+   ========================================================================== */
+
+.numos-r2-admin {
+    max-width: 1200px;
+}
+
+.numos-r2-admin h1 {
+    display: flex;
+    align-items: center;
+    gap: var(--numos-space-md);
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    margin-bottom: var(--numos-space-sm);
+}
+
+/* ==========================================================================
+   Status Band
+   ========================================================================== */
+
+.numos-r2-status-band {
+    background: var(--numos-bg);
+    border: 1px solid var(--numos-border-light);
+    border-radius: var(--numos-radius-lg);
+    padding: var(--numos-space-md) var(--numos-space-lg);
+    margin: var(--numos-space-lg) 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--numos-space-lg);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.numos-r2-status-band-item {
+    display: flex;
+    align-items: center;
+    gap: var(--numos-space-sm);
+    font-size: 13px;
+    color: var(--numos-text-muted);
+}
+
+.numos-r2-status-band-item strong {
+    color: var(--numos-text);
+}
+
+.numos-r2-status-band-item .status-ok {
+    color: var(--numos-success);
+}
+
+.numos-r2-status-band-item .status-error {
+    color: var(--numos-error);
+}
+
+/* ==========================================================================
+   Tab System (CSS-only, radio + :checked)
+   ========================================================================== */
+
+.numos-r2-tabs {
+    margin-top: var(--numos-space-md);
+    border-bottom: 1px solid var(--numos-border-light);
+    margin-bottom: var(--numos-space-lg);
+}
+
+.numos-r2-tab-input {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+}
+
+.numos-r2-tab-label {
+    display: inline-flex;
+    align-items: center;
+    padding: 12px 16px;
+    margin: 0 0 -1px 0;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--numos-text-muted);
+    background: transparent;
+    transition: all var(--numos-transition);
+    user-select: none;
+    white-space: nowrap;
+    line-height: 1;
+}
+
+.numos-r2-tab-label:hover {
+    color: var(--numos-text);
+    border-bottom-color: var(--numos-border);
+}
+
+.numos-r2-tab-input:checked + .numos-r2-tab-label {
+    color: var(--numos-primary);
+    border-bottom-color: var(--numos-primary);
+    font-weight: 600;
+}
+
+.numos-r2-tab-panel {
+    display: none;
+}
+
+/* CSS-only tab switching via :checked ~ panel */
+#numos-r2-tab-dashboard:checked ~ #numos-r2-panel-dashboard,
+#numos-r2-tab-migration:checked ~ #numos-r2-panel-migration,
+#numos-r2-tab-tools:checked ~ #numos-r2-panel-tools,
+#numos-r2-tab-settings:checked ~ #numos-r2-panel-settings,
+#numos-r2-tab-logs:checked ~ #numos-r2-panel-logs {
+    display: block;
+}
+
+/* ==========================================================================
+   Cards Grid
+   ========================================================================== */
+
+.numos-r2-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: var(--numos-space-lg);
+    margin: var(--numos-space-lg) 0;
+}
+
+.numos-r2-card {
+    background: var(--numos-bg);
+    border: 1px solid var(--numos-border-light);
+    border-radius: var(--numos-radius-lg);
+    padding: var(--numos-space-xl) var(--numos-space-lg);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+    transition: all var(--numos-transition);
+}
+
+.numos-r2-card:hover {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+    border-color: var(--numos-border);
+}
+
+.numos-r2-card h3 {
+    margin: 0 0 var(--numos-space-md) 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--numos-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* ==========================================================================
+   Status Indicator
+   ========================================================================== */
+
+.numos-r2-status {
+    font-size: 14px;
+    font-weight: 600;
+    padding: var(--numos-space-sm) var(--numos-space-md);
+    border-radius: var(--numos-radius-sm);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--numos-space-sm);
+    margin-bottom: var(--numos-space-md);
+}
+
+.numos-r2-status.status-ok {
+    background: var(--numos-success-bg);
+    color: var(--numos-success-text);
+}
+
+.numos-r2-status.status-error {
+    background: var(--numos-error-bg);
+    color: var(--numos-error-text);
+}
+
+/* ==========================================================================
+   Stats Display
+   ========================================================================== */
+
+.numos-r2-stat {
+    margin-bottom: var(--numos-space-md);
+}
+
+.numos-r2-stat-number {
+    font-size: 36px;
+    font-weight: 700;
+    color: var(--numos-text);
+    display: block;
+    line-height: 1.1;
+}
+
+.numos-r2-stat-label {
+    font-size: 13px;
+    color: var(--numos-text-muted);
+    margin-top: var(--numos-space-xs);
+}
+
+.numos-r2-stat-detail {
+    font-size: 12px;
+    color: var(--numos-text-light);
+    margin-top: var(--numos-space-xs);
+}
+
+/* ==========================================================================
+   Savings Dashboard
+   ========================================================================== */
+
+.numos-r2-savings {
+    border-color: var(--numos-success);
+    background: linear-gradient(135deg, #f0fdf4, #fff);
+}
+
+.numos-r2-savings h2 {
+    color: var(--numos-success-text);
+    border-bottom-color: #bbf7d0;
+}
+
+.numos-r2-savings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--numos-space-lg);
+}
+
+.numos-r2-savings-card {
+    text-align: center;
+    padding: var(--numos-space-lg) var(--numos-space-md);
+}
+
+.numos-r2-savings-number {
+    display: block;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--numos-success-text);
+    line-height: 1.2;
+}
+
+.numos-r2-savings-label {
+    display: block;
+    font-size: 12px;
+    color: var(--numos-text-muted);
+    margin-top: var(--numos-space-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* ==========================================================================
+   Progress Bars
+   ========================================================================== */
+
+.numos-r2-progress-bar {
+    height: 6px;
+    background: var(--numos-bg-secondary);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: var(--numos-space-md) 0;
+}
+
+.numos-r2-progress-bar.large {
+    height: 24px;
+}
+
+.numos-r2-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--numos-primary), #4f92d4);
+    border-radius: 999px;
+    transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    position: relative;
+}
+
+.numos-r2-progress-bar.large .numos-r2-progress-fill::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.2) 50%,
+        transparent 100%
+    );
+    animation: numos-shimmer 2s infinite;
+}
+
+@keyframes numos-shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+}
+
+.numos-r2-progress-text {
+    font-size: 13px;
+    color: var(--numos-text-muted);
+    font-weight: 500;
+}
+
+/* ==========================================================================
+   Sections
+   ========================================================================== */
+
+.numos-r2-section {
+    background: var(--numos-bg);
+    border: 1px solid var(--numos-border-light);
+    border-radius: var(--numos-radius-lg);
+    padding: var(--numos-space-xl) var(--numos-space-lg);
+    margin: var(--numos-space-lg) 0;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+}
+
+.numos-r2-tab-panel > :first-child {
+    margin-top: 0;
+}
+
+.numos-r2-section h2 {
+    margin: 0 0 var(--numos-space-lg) 0;
+    padding: 0 0 var(--numos-space-md) 0;
+    border-bottom: 1px solid var(--numos-border-light);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--numos-text);
+}
+
+.numos-r2-section p.description {
+    color: var(--numos-text-muted);
+    margin: 0 0 var(--numos-space-md) 0;
+    font-size: 13px;
+}
+
+/* ==========================================================================
+   Migration Controls
+   ========================================================================== */
+
+.numos-r2-migration-controls {
+    display: flex;
+    gap: var(--numos-space-md);
+    margin-bottom: var(--numos-space-lg);
+    flex-wrap: wrap;
+}
+
+.numos-r2-migration-status {
+    text-align: center;
+    padding: var(--numos-space-md);
+    font-size: 14px;
+    color: var(--numos-text);
+}
+
+.numos-r2-migration-eta {
+    font-size: 13px;
+    color: var(--numos-text-muted);
+    margin-top: var(--numos-space-sm);
+}
+
+/* ==========================================================================
+   Log Display
+   ========================================================================== */
+
+.numos-r2-log {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    padding: var(--numos-space-lg);
+    border-radius: var(--numos-radius-md);
+    max-height: 350px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: var(--numos-space-md);
+}
+
+.numos-r2-log:empty {
+    display: none;
+}
+
+.numos-r2-log-controls {
+    display: flex;
+    gap: var(--numos-space-sm);
+    margin-bottom: var(--numos-space-md);
+    flex-wrap: wrap;
+}
+
+/* ==========================================================================
+   Form Styles
+   ========================================================================== */
+
+.numos-r2-admin .form-table th {
+    width: 220px;
+    padding: var(--numos-space-md) var(--numos-space-md) var(--numos-space-md) 0;
+    vertical-align: top;
+}
+
+.numos-r2-admin .form-table td {
+    padding: var(--numos-space-md);
+}
+
+.numos-r2-admin .form-table label {
+    display: flex;
+    align-items: center;
+    gap: var(--numos-space-sm);
+}
+
+.numos-r2-admin .form-table input[type="number"] {
+    width: 80px;
+}
+
+.numos-r2-admin .form-table .range-slider {
+    display: flex;
+    align-items: center;
+    gap: var(--numos-space-md);
+}
+
+.numos-r2-admin .form-table .range-slider input[type="range"] {
+    flex: 1;
+    max-width: 200px;
+}
+
+.numos-r2-admin .form-table .range-value {
+    font-weight: 600;
+    min-width: 50px;
+}
+
+/* ==========================================================================
+   Button States
+   ========================================================================== */
+
+.numos-r2-admin .button {
+    transition: all var(--numos-transition);
+    border-radius: var(--numos-radius-md) !important;
+}
+
+.numos-r2-admin .button.loading {
+    opacity: 0.7;
+    pointer-events: none;
+    position: relative;
+}
+
+.numos-r2-admin .button.loading::after {
+    content: '';
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    margin-left: var(--numos-space-sm);
+    border: 2px solid currentColor;
+    border-radius: 50%;
+    border-top-color: transparent;
+    animation: numos-r2-spin 0.8s linear infinite;
+    vertical-align: middle;
+}
+
+@keyframes numos-r2-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ==========================================================================
+   Config Table
+   ========================================================================== */
+
+.numos-r2-admin .widefat {
+    margin-top: var(--numos-space-md);
+}
+
+.numos-r2-admin .widefat td {
+    padding: var(--numos-space-md) var(--numos-space-lg);
+}
+
+.numos-r2-admin .widefat code {
+    background: var(--numos-bg-secondary);
+    padding: 2px 6px;
+    border-radius: var(--numos-radius-sm);
+    font-size: 12px;
+}
+
+/* ==========================================================================
+   Notice Styles
+   ========================================================================== */
+
+.numos-r2-notice {
+    padding: var(--numos-space-md) var(--numos-space-lg);
+    border-radius: var(--numos-radius-md);
+    margin: var(--numos-space-md) 0;
+    display: flex;
+    align-items: center;
+    gap: var(--numos-space-sm);
+    animation: numos-slide-in 0.3s ease;
+}
+
+@keyframes numos-slide-in {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.numos-r2-notice.success {
+    background: var(--numos-success-bg);
+    border: 1px solid var(--numos-success);
+    color: var(--numos-success-text);
+}
+
+.numos-r2-notice.error {
+    background: var(--numos-error-bg);
+    border: 1px solid var(--numos-error);
+    color: var(--numos-error-text);
+}
+
+.numos-r2-notice.warning {
+    background: var(--numos-warning-bg);
+    border: 1px solid var(--numos-warning);
+    color: var(--numos-warning-text);
+}
+
+/* ==========================================================================
+   Danger Zone
+   ========================================================================== */
+
+.numos-r2-danger-zone {
+    border-color: var(--numos-error);
+    background: #fef2f2;
+}
+
+.numos-r2-danger-zone h2 {
+    color: var(--numos-error-text);
+    border-bottom-color: #fecaca;
+}
+
+.numos-r2-danger-zone p {
+    color: #7f1d1d;
+    margin: 0 0 var(--numos-space-md) 0;
+}
+
+.numos-r2-admin .button-danger {
+    background: #dc2626 !important;
+    border-color: #b91c1c !important;
+    color: #fff !important;
+}
+
+.numos-r2-admin .button-danger:hover,
+.numos-r2-admin .button-danger:focus {
+    background: #b91c1c !important;
+    border-color: #991b1b !important;
+    color: #fff !important;
+}
+
+/* ==========================================================================
+   Orphan Files List
+   ========================================================================== */
+
+.numos-r2-orphan-controls {
+    display: flex;
+    gap: var(--numos-space-md);
+    margin-bottom: var(--numos-space-md);
+    flex-wrap: wrap;
+}
+
+.numos-r2-orphan-list {
+    max-height: 400px;
+    overflow-y: auto;
+    margin-top: var(--numos-space-md);
+    border: 1px solid var(--numos-border-light);
+    border-radius: var(--numos-radius-sm);
+}
+
+.numos-r2-orphan-list table {
+    margin: 0;
+}
+
+.numos-r2-orphan-list code {
+    font-size: 11px;
+    word-break: break-all;
+}
+
+.numos-r2-success {
+    color: var(--numos-success-text);
+    font-weight: 600;
+}
+
+#numos-r2-orphan-summary,
+#numos-r2-db-orphan-summary {
+    padding: var(--numos-space-md);
+    background: var(--numos-bg-secondary);
+    border-radius: var(--numos-radius-sm);
+}
+
+#numos-r2-orphan-summary p,
+#numos-r2-db-orphan-summary p {
+    margin: var(--numos-space-xs) 0;
+}
+
+/* ==========================================================================
+   Media Library Badges (List View Column + Grid View Overlay)
+   ========================================================================== */
+
+.numos-r2-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+
+.numos-r2-badge-synced {
+    background: var(--numos-success-bg);
+    color: var(--numos-success-text);
+}
+
+.numos-r2-badge-r2only {
+    background: var(--numos-info-bg);
+    color: var(--numos-info-text);
+}
+
+.numos-r2-badge-partial {
+    background: var(--numos-warning-bg);
+    color: var(--numos-warning-text);
+}
+
+.numos-r2-badge-local {
+    background: var(--numos-bg-secondary);
+    color: var(--numos-text-muted);
+}
+
+/* Grid view overlay badge */
+.numos-r2-grid-badge {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1.6;
+    z-index: 10;
+    pointer-events: none;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+
+.numos-r2-grid-badge-synced {
+    background: rgba(16, 185, 129, 0.9);
+    color: #fff;
+}
+
+.numos-r2-grid-badge-r2only {
+    background: rgba(59, 130, 246, 0.9);
+    color: #fff;
+}
+
+.numos-r2-grid-badge-partial {
+    background: rgba(245, 158, 11, 0.9);
+    color: #fff;
+}
+
+/* ==========================================================================
+   Debug Section
+   ========================================================================== */
+
+.numos-r2-debug {
+    background: var(--numos-bg-secondary);
+    border: 1px solid var(--numos-border-light);
+    border-radius: var(--numos-radius-md);
+    margin-top: var(--numos-space-lg);
+}
+
+.numos-r2-debug summary {
+    cursor: pointer;
+    padding: var(--numos-space-md);
+    font-weight: 500;
+    user-select: none;
+}
+
+.numos-r2-debug summary:hover {
+    background: rgba(0, 0, 0, 0.02);
+}
+
+.numos-r2-debug details[open] summary {
+    border-bottom: 1px solid var(--numos-border-light);
+}
+
+.numos-r2-debug pre {
+    margin: 0;
+    padding: var(--numos-space-md);
+    font-size: 12px;
+    overflow-x: auto;
+}
+
+.numos-r2-debug-table {
+    width: 100%;
+    font-size: 13px;
+}
+
+.numos-r2-debug-table td {
+    padding: var(--numos-space-sm) var(--numos-space-md);
+    border-bottom: 1px solid var(--numos-border-light);
+}
+
+.numos-r2-debug-table td:first-child {
+    font-weight: 500;
+    width: 40%;
+}
+
+/* ==========================================================================
+   Verify Results
+   ========================================================================== */
+
+#numos-r2-verify-summary {
+    padding: var(--numos-space-md);
+    background: var(--numos-bg-secondary);
+    border-radius: var(--numos-radius-sm);
+}
+
+#numos-r2-verify-summary p {
+    margin: var(--numos-space-xs) 0;
+}
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+
+@media screen and (max-width: 782px) {
+    .numos-r2-cards {
+        grid-template-columns: 1fr;
+    }
+
+    .numos-r2-savings-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+
+    .numos-r2-migration-controls {
+        flex-direction: column;
+    }
+
+    .numos-r2-status-band {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .numos-r2-admin .form-table th {
+        width: auto;
+        display: block;
+        padding-bottom: var(--numos-space-xs);
+    }
+
+    .numos-r2-admin .form-table td {
+        display: block;
+        padding-top: 0;
+    }
+
+    .numos-r2-stat-number {
+        font-size: 28px;
+    }
+
+    .numos-r2-tab-label {
+        padding: 10px 12px;
+        font-size: 12px;
+    }
+}
+
+/* ==========================================================================
+   Accessibility
+   ========================================================================== */
+
+.numos-r2-admin .screen-reader-text {
+    position: absolute;
+    left: -10000px;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+}
+
+.numos-r2-admin :focus-visible {
+    outline: 2px solid var(--numos-primary);
+    outline-offset: 2px;
+}
+
+/* High contrast mode */
+@media (prefers-contrast: high) {
+    :root {
+        --numos-border: #000;
+        --numos-text-muted: #000;
+    }
+
+    .numos-r2-card,
+    .numos-r2-section {
+        border-width: 2px;
+    }
+}
