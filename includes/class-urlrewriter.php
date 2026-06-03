@@ -160,6 +160,45 @@ class UrlRewriter {
     }
 
     /**
+     * Build a regex fragment matching the local uploads base URL.
+     * The host is matched case-insensitively (RFC 3986), the path stays case-sensitive.
+     *
+     * @param bool $json_escaped Whether slashes are JSON-escaped (\/) in the target string
+     * @return string Regex fragment (no delimiters, no trailing slash)
+     */
+    private function build_base_pattern(bool $json_escaped = false): string {
+        $parsed = parse_url($this->local_base_url);
+
+        if (!$parsed || empty($parsed['host'])) {
+            $base = $json_escaped
+                ? str_replace('/', '\\/', $this->local_base_url)
+                : $this->local_base_url;
+            return preg_quote($base, '#');
+        }
+
+        // Split around the host to preserve any scheme/port/path exactly as-is.
+        $host_pos = strpos($this->local_base_url, $parsed['host']);
+        if ($host_pos === false) {
+            $base = $json_escaped
+                ? str_replace('/', '\\/', $this->local_base_url)
+                : $this->local_base_url;
+            return preg_quote($base, '#');
+        }
+
+        $before_host = substr($this->local_base_url, 0, $host_pos);
+        $after_host = substr($this->local_base_url, $host_pos + strlen($parsed['host']));
+
+        if ($json_escaped) {
+            $before_host = str_replace('/', '\\/', $before_host);
+            $after_host = str_replace('/', '\\/', $after_host);
+        }
+
+        return preg_quote($before_host, '#')
+            . '(?i:' . preg_quote($parsed['host'], '#') . ')'
+            . preg_quote($after_host, '#');
+    }
+
+    /**
      * Rewrite URLs in post content (only for synced files)
      *
      * @param string $content Post content
@@ -182,11 +221,11 @@ class UrlRewriter {
             return $content;
         }
 
-        $escaped_base = preg_quote($this->local_base_url, '#');
+        $base_pattern = $this->build_base_pattern();
         $r2_url_with_prefix = $this->r2_base_url . '/' . $this->prefix;
 
         return preg_replace_callback(
-            '#' . $escaped_base . '/([^\s"\'<>]+)#',
+            '#' . $base_pattern . '/([^\s"\'<>]+)#',
             function ($matches) use ($synced_paths, $r2_url_with_prefix) {
                 $relative_path = $matches[1];
 
@@ -464,9 +503,9 @@ class UrlRewriter {
         $r2_url_with_prefix = $this->r2_base_url . '/' . $this->prefix;
 
         // Pass 1: plain URLs (HTML, CSS, unescaped JSON)
-        $escaped_base = preg_quote($this->local_base_url, '#');
+        $base_pattern = $this->build_base_pattern();
         $output = preg_replace_callback(
-            '#' . $escaped_base . '/([^\s"\'<>\\\\]+)#',
+            '#' . $base_pattern . '/([^\s"\'<>\\\\]+)#',
             function ($matches) use ($synced_paths, $r2_url_with_prefix) {
                 $relative_path = $matches[1];
                 $decoded_path = urldecode($relative_path);
@@ -481,12 +520,11 @@ class UrlRewriter {
         );
 
         // Pass 2: JSON-escaped URLs (slashes escaped as \/)
-        $json_escaped_base = str_replace('/', '\\/', $this->local_base_url);
-        $escaped_json_base = preg_quote($json_escaped_base, '#');
+        $json_base_pattern = $this->build_base_pattern(true);
         $json_r2_prefix = str_replace('/', '\\/', $r2_url_with_prefix);
 
         $output = preg_replace_callback(
-            '#' . $escaped_json_base . '((?:\\\\/[^\\s"\'<>&\\\\]+)+)#',
+            '#' . $json_base_pattern . '((?:\\\\/[^\\s"\'<>&\\\\]+)+)#',
             function ($matches) use ($synced_paths, $json_r2_prefix) {
                 // Unescape the path for lookup (capture includes leading \/)
                 $escaped_path = $matches[1];
