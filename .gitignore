@@ -17,3 +17,4 @@ node_modules/
 
 # Composer (not used, but just in case)
 vendor/
+CLAUDE.md
