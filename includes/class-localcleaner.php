@@ -33,12 +33,14 @@ class LocalCleaner {
     }
 
     /**
-     * True when the file at $path holds the bytes the manifest entry describes. Without a
-     * recorded MD5 (multipart upload of the first release) only the size can be compared.
+     * True when the file at $path holds the bytes the manifest entry describes. An entry
+     * backfilled from a multipart ETag has no MD5: equal sizes do not show the same bytes, so
+     * such an entry never matches and its file is neither deleted nor claimed.
      */
     private function matches_entry(string $path, array $entry): bool {
-        return filesize($path) === (int) $entry['size']
-            && ($entry['md5'] === '' || md5_file($path) === $entry['md5']);
+        return $entry['md5'] !== ''
+            && filesize($path) === (int) $entry['size']
+            && md5_file($path) === $entry['md5'];
     }
 
     /**
@@ -501,7 +503,7 @@ class LocalCleaner {
         $manifest = ['v' => Manifest::SCHEMA, 'files' => []];
         // Once the first release removed the local copies, a file at one of these paths may be
         // another upload under a reused name: it counts as the local copy only if identical.
-        $deleted_before = get_post_meta($attachment_id, '_numos_r2_local_deleted', true) !== '';
+        $deleted_before = Manifest::has_deletion_marker($attachment_id);
 
         foreach ($keys as $relative => $key) {
             if (!isset($index[$key])) {

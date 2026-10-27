@@ -157,6 +157,14 @@ class Manifest {
     }
 
     /**
+     * True while the attachment carries the local deletion marker: some of its files may exist
+     * only on R2, and a file found at one of its paths may be another upload under a reused name.
+     */
+    public static function has_deletion_marker(int $attachment_id): bool {
+        return get_post_meta($attachment_id, '_numos_r2_local_deleted', true) !== '';
+    }
+
+    /**
      * R2 key of every file recorded for this attachment.
      *
      * @return array<string,string> relative path => key

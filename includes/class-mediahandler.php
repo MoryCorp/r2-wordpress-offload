@@ -12,12 +12,22 @@ class MediaHandler {
     private R2Client $r2_client;
     private array $settings;
 
+    /** @var string[] paths of attachments deleted in this request that hold another file */
+    private array $foreign_paths = [];
+
+    /** @var string[] paths holding the own file of an attachment deleted in this request */
+    private array $owned_paths = [];
+
     public function __construct(R2Client $r2_client) {
         $this->r2_client = $r2_client;
         $this->settings = get_option('numos_r2_settings', []);
     }
 
     public function register_hooks(): void {
+        // Local copies already removed by the plugin must stay protected whatever the settings.
+        add_action('delete_attachment', [$this, 'protect_foreign_files'], 10, 1);
+        add_filter('wp_delete_file', [$this, 'keep_foreign_file']);
+
         if (empty($this->settings['enabled']) || empty($this->settings['sync_new_uploads'])) {
             return;
         }
@@ -127,6 +137,9 @@ class MediaHandler {
             return $this->outcome('skipped', 'File type not allowed');
         }
         $manifest = Manifest::get($attachment_id);
+        if ($manifest === null && Manifest::has_deletion_marker($attachment_id)) {
+            return $this->outcome('failed', 'Offloaded by the first release: run sync-from-r2 before uploading it again');
+        }
         $base_dir = wp_upload_dir()['basedir'];
         foreach ($manifest['files'] ?? [] as $relative => $entry) {
             if ($entry['state'] !== Manifest::STATE_UPLOADED || !file_exists($base_dir . '/' . $relative)) {
@@ -141,20 +154,16 @@ class MediaHandler {
     }
 
     /**
-     * Delete an attachment's objects from R2: the keys of its manifest or, for media offloaded
-     * by the first release and not backfilled yet, its first-release keys.
+     * Delete the R2 objects of an attachment's manifest. Without a manifest the owner of a
+     * first-release key cannot be established, another attachment may hold the same one: those
+     * objects are left to the orphan cleanup.
      */
     public function handle_delete(int $attachment_id): void {
         $manifest = Manifest::get($attachment_id);
-        // Media that never reached R2 own no object: their first-release keys may be those of
-        // an R2-only homonym.
-        if ($manifest === null && !Manifest::has_trace($attachment_id)) {
+        if ($manifest === null) {
             return;
         }
-        $keys = $manifest !== null
-            ? Manifest::keys($manifest)
-            : Manifest::legacy_keys($attachment_id, numos_r2_get_site_prefix(), wp_upload_dir()['basedir']);
-
+        $keys = Manifest::keys($manifest);
         $keys = array_diff($keys, Manifest::shared_keys($attachment_id, $keys));
         $result = $this->r2_client->delete_objects(array_values($keys));
         if (!empty($result['errors'])) {
@@ -169,6 +178,50 @@ class MediaHandler {
         UrlRewriter::forget_map();
 
         Logger::log('info', "Deleted attachment {$attachment_id} from R2");
+    }
+
+    /**
+     * Before WordPress deletes an attachment's files, record the paths where its own file was
+     * removed locally: WordPress hands a freed name to the next upload, so whatever is there now
+     * belongs to another attachment. Records cover the whole request, since a hook may delete
+     * other attachments meanwhile, and a path held by an attachment deleted in the same request
+     * is never kept.
+     */
+    public function protect_foreign_files(int $attachment_id): void {
+        $main = get_attached_file($attachment_id);
+        $metadata = wp_get_attachment_metadata($attachment_id);
+        $paths = $main ? Manifest::attachment_paths($main, is_array($metadata) ? $metadata : []) : [];
+
+        $manifest = Manifest::get($attachment_id);
+        if ($manifest !== null) {
+            $base_dir = wp_upload_dir()['basedir'];
+            $foreign = array_map(function ($relative) use ($base_dir) {
+                return $base_dir . '/' . $relative;
+            }, array_keys(Manifest::remote_only($manifest)));
+        } else {
+            $foreign = Manifest::has_deletion_marker($attachment_id) ? $paths : [];
+        }
+
+        $foreign = array_map('wp_normalize_path', $foreign);
+        $owned = array_diff(array_map('wp_normalize_path', $paths), $foreign);
+        $this->foreign_paths = array_merge($this->foreign_paths, $foreign);
+        $this->owned_paths = array_merge($this->owned_paths, $owned);
+    }
+
+    /**
+     * wp_delete_file filter: skips a path recorded as holding the file of an attachment that is
+     * not being deleted.
+     */
+    public function keep_foreign_file($file) {
+        if (!is_string($file)) {
+            return $file;
+        }
+        $path = wp_normalize_path($file);
+        if (in_array($path, $this->foreign_paths, true) && !in_array($path, $this->owned_paths, true)) {
+            Logger::log('info', "Kept {$file}: it is not the deleted attachment's file");
+            return '';
+        }
+        return $file;
     }
 
     /**

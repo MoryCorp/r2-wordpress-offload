@@ -39,6 +39,17 @@ r2t_out('h2', $after === $before, $after === $before
     ? 'manifeste du premier inchangé'
     : 'manifeste du premier remplacé par les fichiers du second');
 
+// h2b: as h2, for a media of the first release that the backfill has not reached yet.
+r2t_reset();
+$a = r2t_upload(r2t_image(43), 'h2b.jpg', false);
+r2t_make_legacy($a, true);
+r2t_upload(r2t_image(44), 'h2b.jpg');
+r2t_media_handler()->upload_attachment($a);
+$taken = Manifest::get($a) !== null;
+r2t_out('h2b', !$taken, $taken
+    ? 'manifeste du média historique construit sur les fichiers du second'
+    : 'envoi refusé, média historique inchangé');
+
 // h3: backfill of a media offloaded by the first release whose name now holds another file.
 r2t_reset(['remove_local_files' => true]);
 $a = r2t_upload(r2t_image(34), 'h3.jpg', false);
@@ -48,6 +59,22 @@ r2t_cleaner()->sync_from_r2();
 r2t_out('h3', r2t_protected($a), r2t_protected($a)
     ? 'média historique toujours marqué sans copie locale'
     : 'fichier du second pris pour la copie locale du média historique');
+
+// h3b: as h3, but the object carries a multipart ETag, which holds no MD5 of the payload.
+r2t_reset(['remove_local_files' => true]);
+$src = r2t_image(42);
+$a = r2t_upload($src, 'h3b.jpg', false);
+r2t_make_legacy($a, true);
+$main_key = r2t_legacy_key(get_attached_file($a));
+r2t_store_put_meta($main_key, r2t_store_meta($main_key)['size'], md5('multipart') . '-2');
+$b = r2t_upload($src, 'h3b.jpg', false);
+$local = get_attached_file($b);
+$bytes = r2t_flip_byte(file_get_contents($local));
+file_put_contents($local, $bytes);
+r2t_cleaner()->sync_from_r2();
+r2t_cleaner()->delete_local_files($a);
+$intact = file_exists($local) && file_get_contents($local) === $bytes;
+r2t_out('h3b', $intact, 'fichier principal du second ' . ($intact ? 'intact' : 'supprimé comme copie locale du média historique'));
 
 // h4: two media of the first release on the same key (same file uploaded twice under one name).
 r2t_reset(['remove_local_files' => true]);
@@ -61,6 +88,18 @@ $shared = array_intersect(Manifest::keys(Manifest::get($a)), Manifest::keys(Mani
 wp_delete_attachment($b, true);
 $lost = array_filter($shared, function ($key) { return r2t_store_get($key) === null; });
 r2t_out('h4', $shared && !$lost, sprintf('%d clé(s) partagée(s), %d supprimée(s) avec le second média', count($shared), count($lost)));
+
+// h4b: as h4, before any backfill: neither media has a manifest.
+r2t_reset(['remove_local_files' => true]);
+$src = r2t_image(41);
+$a = r2t_upload($src, 'h4b.jpg', false);
+r2t_make_legacy($a, true);
+$b = r2t_upload($src, 'h4b.jpg', false);
+r2t_make_legacy($b, true);
+$keys = array_map('r2t_legacy_key', r2t_files($a));
+wp_delete_attachment($b, true);
+$lost = array_filter($keys, function ($key) { return r2t_store_get($key) === null; });
+r2t_out('h4b', !$lost, sprintf('%d clé(s) du premier média, %d supprimée(s) avec le second', count($keys), count($lost)));
 
 // h5: an upload takes the name while the restore is downloading.
 r2t_reset(['remove_local_files' => true]);
@@ -77,3 +116,81 @@ while (file_exists("/proc/$pid")) {
 r2t_fault([]);
 $intact = file_get_contents($local) === $bytes;
 r2t_out('h5', $intact, $intact ? 'fichier arrivé pendant la restauration intact' : 'fichier arrivé pendant la restauration écrasé');
+
+// h6: the first attachment, R2-only, is deleted while its names hold a newer attachment's only
+// copy. WordPress removes the files at the deleted attachment's paths.
+function r2t_delete_first_keeps_second(string $id, int $a, int $b, ?callable $delete = null): void {
+    $paths = r2t_files($b);
+    $bytes = array_map('file_get_contents', $paths);
+    $same = get_attached_file($a) === get_attached_file($b);
+    $delete ? $delete($a) : wp_delete_attachment($a, true);
+    clearstatcache();
+    $kept = array_map(function ($path) { return file_exists($path) ? file_get_contents($path) : null; }, $paths) === $bytes;
+    r2t_out($id, $same ? $kept : null, ($same ? 'nom réutilisé' : 'nom différent')
+        . ', copie unique du second ' . ($kept ? 'intacte' : 'supprimée avec le premier'));
+}
+
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(39), 'h6.jpg');
+$b = r2t_upload(r2t_image(40), 'h6.jpg', false);
+r2t_delete_first_keeps_second('h6', $a, $b);
+
+// h6b: the same with a media of the first release, not backfilled.
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(48), 'h6b.jpg', false);
+r2t_make_legacy($a, true);
+$b = r2t_upload(r2t_image(49), 'h6b.jpg', false);
+r2t_delete_first_keeps_second('h6b', $a, $b);
+
+// h6c: as h6 with new uploads no longer synced, in a request that registers the hooks under
+// that setting: the files removed earlier are still the plugin's doing.
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(50), 'h6c.jpg');
+$b = r2t_upload(r2t_image(51), 'h6c.jpg', false);
+r2t_settings(['sync_new_uploads' => false]);
+r2t_delete_first_keeps_second('h6c', $a, $b, function ($id) {
+    r2t_child("wp_delete_attachment($id, true);", 60);
+});
+
+// h6d: as h6 while another plugin deletes an unrelated attachment during that deletion.
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(52), 'h6d.jpg');
+$b = r2t_upload(r2t_image(53), 'h6d.jpg', false);
+$c = r2t_upload(r2t_image(54), 'h6d-autre.jpg', false);
+$nested = function ($id) use ($a, $c) {
+    if ((int) $id === $a) {
+        wp_delete_attachment($c, true);
+    }
+};
+add_action('delete_attachment', $nested, 20);
+r2t_delete_first_keeps_second('h6d', $a, $b);
+remove_action('delete_attachment', $nested, 20);
+
+// h6e: both deleted in one request, the first then the second: the second's files go with it.
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(55), 'h6e.jpg');
+$b = r2t_upload(r2t_image(56), 'h6e.jpg', false);
+$paths = r2t_files($b);
+wp_delete_attachment($a, true);
+wp_delete_attachment($b, true);
+clearstatcache();
+$left = array_filter($paths, 'file_exists');
+r2t_out('h6e', !$left, $left ? count($left) . ' fichier(s) du second laissé(s) sur le disque' : 'fichiers du second supprimés avec lui');
+
+// h6f: the second is deleted, and a hook on that deletion deletes the first before WordPress
+// removes the second's files: they must still go.
+r2t_reset(['remove_local_files' => true]);
+$a = r2t_upload(r2t_image(57), 'h6f.jpg');
+$b = r2t_upload(r2t_image(58), 'h6f.jpg', false);
+$paths = r2t_files($b);
+$nested = function ($id) use ($a, $b) {
+    if ((int) $id === $b) {
+        wp_delete_attachment($a, true);
+    }
+};
+add_action('delete_attachment', $nested, 20);
+wp_delete_attachment($b, true);
+remove_action('delete_attachment', $nested, 20);
+clearstatcache();
+$left = array_filter($paths, 'file_exists');
+r2t_out('h6f', !$left, $left ? count($left) . ' fichier(s) du second laissé(s) sur le disque' : 'fichiers du second supprimés avec lui');

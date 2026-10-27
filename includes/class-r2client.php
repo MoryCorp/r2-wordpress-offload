@@ -436,16 +436,39 @@ class R2Client {
             }
         }
 
-        // link() refuses an existing target, unlike rename(): a file that took this path during
-        // the download is kept. rename() remains for filesystems without hard links.
-        $placed = @link($tmp, $local_path) || (!file_exists($local_path) && @rename($tmp, $local_path));
+        $placed = self::copy_exclusive($tmp, $local_path);
         @unlink($tmp);
         if (!$placed) {
-            Logger::log('error', "Could not move restored file into place: {$local_path}");
+            Logger::log('error', "Restored file not placed, path taken or write failed: {$local_path}");
             return false;
         }
 
         return true;
+    }
+
+    /**
+     * Copy $from to $to only if nothing exists at $to: mode 'x' fails on an existing path, so a
+     * file that took it meanwhile, possibly another attachment's only copy, is never overwritten.
+     * rename() would replace it, and link() is disabled in many PHP-FPM pools.
+     */
+    private static function copy_exclusive(string $from, string $to): bool {
+        $out = @fopen($to, 'xb');
+        if ($out === false) {
+            return false;
+        }
+        $in = fopen($from, 'rb');
+        $copied = $in !== false && stream_copy_to_stream($in, $out) === filesize($from) && fflush($out);
+        if ($in !== false) {
+            fclose($in);
+        }
+        $inode = fstat($out)['ino'];
+        fclose($out);
+        clearstatcache(true, $to);
+        // Remove a partial copy only while the path still holds the file created here.
+        if (!$copied && @fileinode($to) === $inode) {
+            @unlink($to);
+        }
+        return $copied;
     }
 
     public function delete_object(string $key): bool {
