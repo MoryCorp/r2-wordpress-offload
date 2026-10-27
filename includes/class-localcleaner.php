@@ -4,7 +4,10 @@ namespace NumosR2;
 defined('ABSPATH') || exit;
 
 /**
- * LocalCleaner - Verify R2 files, delete local copies, restore from R2
+ * Verification, deletion and restore are driven by the manifest and the MD5 it records, never
+ * by size alone nor by keys recomputed from the current state. A local file is removed only
+ * once its R2 object and the file itself both match the manifest entry, and its deletion is
+ * recorded before the unlink.
  */
 class LocalCleaner {
 
@@ -14,70 +17,80 @@ class LocalCleaner {
         $this->r2_client = $r2_client;
     }
 
+    private function basedir(): string {
+        return wp_upload_dir()['basedir'];
+    }
+
     /**
-     * Verify that all files for an attachment exist on R2 with correct sizes
+     * A multipart ETag (md5-N) and an empty recorded MD5 (backfilled entry) cannot be compared
+     * and count as a match: the size check done before is then the only control.
+     */
+    private function etag_matches(string $etag, string $md5): bool {
+        if ($md5 === '' || strpos($etag, '-') !== false) {
+            return true;
+        }
+        return $etag === $md5;
+    }
+
+    /**
+     * True when the file at $path holds the bytes the manifest entry describes. Without a
+     * recorded MD5 (multipart upload of the first release) only the size can be compared.
+     */
+    private function matches_entry(string $path, array $entry): bool {
+        return filesize($path) === (int) $entry['size']
+            && ($entry['md5'] === '' || md5_file($path) === $entry['md5']);
+    }
+
+    /**
+     * Manifest of an attachment, or null with the reason appended to $errors when it has none
+     * or when R2 is needed and unreachable.
+     */
+    private function manifest_for(int $attachment_id, bool $needs_r2, array &$errors): ?array {
+        $manifest = Manifest::get($attachment_id);
+        if ($manifest === null) {
+            $errors[] = "Attachment {$attachment_id} has no R2 manifest";
+        } elseif ($needs_r2 && !$this->r2_client->is_available()) {
+            $errors[] = 'R2 is not available';
+            $manifest = null;
+        }
+        return $manifest;
+    }
+
+    /**
+     * Verify every file of an attachment against R2 by size and MD5 (via HEAD).
      *
-     * @param int $attachment_id Attachment ID
-     * @return array ['verified' => bool, 'files' => [...], 'errors' => [...]]
+     * @return array{verified:bool,files:array,errors:string[]}
      */
     public function verify_attachment(int $attachment_id): array {
-        $result = [
-            'verified' => false,
-            'files' => [],
-            'errors' => [],
-        ];
+        $result = ['verified' => false, 'files' => [], 'errors' => []];
 
-        $status = get_post_meta($attachment_id, '_numos_r2_status', true);
-        if ($status !== 'synced') {
-            $result['errors'][] = "Attachment {$attachment_id} is not synced (status: {$status})";
+        $manifest = $this->manifest_for($attachment_id, true, $result['errors']);
+        if ($manifest === null) {
             return $result;
         }
 
-        if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available';
-            return $result;
-        }
-
-        $local_files = $this->get_attachment_files($attachment_id);
-        if (empty($local_files)) {
-            $result['errors'][] = "No files found for attachment {$attachment_id}";
-            return $result;
-        }
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-        $prefix = numos_r2_get_site_prefix();
         $all_ok = true;
-
-        foreach ($local_files as $file_path) {
-            $relative = ltrim(str_replace($base_dir, '', $file_path), '/');
-            $r2_key = $prefix . '/' . $relative;
-
-            $head = $this->r2_client->head_object($r2_key);
-            $local_size = file_exists($file_path) ? filesize($file_path) : null;
-
-            $file_info = [
-                'path' => $file_path,
-                'r2_key' => $r2_key,
-                'local_size' => $local_size,
-                'r2_size' => $head ? $head['content_length'] : null,
-                'exists_on_r2' => $head !== false,
-                'size_match' => false,
-            ];
+        foreach ($manifest['files'] as $relative => $entry) {
+            $head = $this->r2_client->head_object($entry['key']);
+            $info = ['relative' => $relative, 'key' => $entry['key'], 'ok' => false];
 
             if ($head === false) {
-                $file_info['error'] = 'Not found on R2';
-                $result['errors'][] = "File not on R2: {$r2_key}";
+                $info['error'] = 'Not found on R2';
+                $result['errors'][] = "Not on R2: {$entry['key']}";
                 $all_ok = false;
-            } elseif ($local_size !== null && $head['content_length'] !== $local_size) {
-                $file_info['error'] = "Size mismatch: local={$local_size}, R2={$head['content_length']}";
-                $result['errors'][] = "Size mismatch for {$r2_key}";
+            } elseif ((int) $head['content_length'] !== (int) $entry['size']) {
+                $info['error'] = "Size mismatch: R2={$head['content_length']}, manifest={$entry['size']}";
+                $result['errors'][] = "Size mismatch for {$entry['key']}";
+                $all_ok = false;
+            } elseif (!$this->etag_matches($head['etag'], $entry['md5'])) {
+                $info['error'] = 'Content (ETag) mismatch';
+                $result['errors'][] = "Content mismatch for {$entry['key']}";
                 $all_ok = false;
             } else {
-                $file_info['size_match'] = true;
+                $info['ok'] = true;
             }
 
-            $result['files'][] = $file_info;
+            $result['files'][] = $info;
         }
 
         $result['verified'] = $all_ok;
@@ -85,56 +98,26 @@ class LocalCleaner {
     }
 
     /**
-     * Verify all synced attachments using list_objects instead of individual HEAD requests
+     * Verify all manifests against a single R2 listing (cheaper than per-file HEAD).
      *
-     * @return array ['ok' => int, 'issues' => int, 'details' => [...]]
+     * @return array{ok:int,issues:int,details:array,error?:string}
      */
     public function verify_all(): array {
         $result = ['ok' => 0, 'issues' => 0, 'details' => []];
 
-        $prefix = numos_r2_get_site_prefix();
-        $r2_index = $this->r2_client->list_all_objects($prefix . '/');
-
-        if (empty($r2_index)) {
+        $index = $this->r2_client->list_all_objects(numos_r2_get_site_prefix() . '/');
+        if ($index === null) {
+            $result['error'] = 'Could not list R2 objects';
             return $result;
         }
 
-        global $wpdb;
-        $synced_ids = array_map('intval', $wpdb->get_col($wpdb->prepare(
-            "SELECT DISTINCT post_id FROM {$wpdb->postmeta}
-             WHERE meta_key = '_numos_r2_status' AND meta_value = %s",
-            'synced'
-        )));
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-
-        foreach ($synced_ids as $id) {
-            $files = $this->get_attachment_files($id);
-            $has_issue = false;
-            $errors = [];
-
-            foreach ($files as $file_path) {
-                $relative = ltrim(str_replace($base_dir, '', $file_path), '/');
-                $r2_key = $prefix . '/' . $relative;
-
-                if (!isset($r2_index[$r2_key])) {
-                    $errors[] = "Not found on R2: {$r2_key}";
-                    $has_issue = true;
-                } else {
-                    $local_size = file_exists($file_path) ? filesize($file_path) : null;
-                    if ($local_size !== null && $r2_index[$r2_key]['size'] !== $local_size) {
-                        $errors[] = "Size mismatch for {$r2_key}: local={$local_size}, R2={$r2_index[$r2_key]['size']}";
-                        $has_issue = true;
-                    }
-                }
-            }
-
-            if ($has_issue) {
+        foreach ($this->all_manifests() as $id => $manifest) {
+            $errors = $this->verify_against_index($manifest, $index);
+            if (empty($errors)) {
+                $result['ok']++;
+            } else {
                 $result['issues']++;
                 $result['details'][] = ['id' => $id, 'errors' => $errors];
-            } else {
-                $result['ok']++;
             }
         }
 
@@ -142,152 +125,39 @@ class LocalCleaner {
     }
 
     /**
-     * Delete all local files for synced attachments using R2 index (single list call)
+     * Check a manifest against an R2 listing. Returns the list of problems (empty = all good).
      *
-     * @return array ['deleted' => int, 'freed_bytes' => int, 'skipped' => int, 'errors' => [...]]
+     * @return string[]
      */
-    public function delete_all_local(): array {
-        $result = ['deleted' => 0, 'freed_bytes' => 0, 'skipped' => 0, 'errors' => []];
-
-        if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available — refusing to delete local files';
-            return $result;
+    private function verify_against_index(array $manifest, array $index): array {
+        $errors = [];
+        foreach ($manifest['files'] as $entry) {
+            $key = $entry['key'];
+            if (!isset($index[$key])) {
+                $errors[] = "Not on R2: {$key}";
+            } elseif ((int) $index[$key]['size'] !== (int) $entry['size']) {
+                $errors[] = "Size mismatch for {$key}";
+            } elseif (!$this->etag_matches($index[$key]['etag'], $entry['md5'])) {
+                $errors[] = "Content mismatch for {$key}";
+            }
         }
-
-        // 1. Build R2 index once
-        $prefix = numos_r2_get_site_prefix();
-        $r2_index = $this->r2_client->list_all_objects($prefix . '/');
-
-        if (empty($r2_index)) {
-            $result['errors'][] = 'R2 index is empty — refusing to delete local files';
-            return $result;
-        }
-
-        // 2. Load all synced attachments that still have local files
-        $attachment_ids = $this->get_synced_with_local(999999, 0);
-
-        if (empty($attachment_ids)) {
-            return $result;
-        }
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-
-        // 3. Process each attachment
-        foreach ($attachment_ids as $id) {
-            $already_deleted = get_post_meta($id, '_numos_r2_local_deleted', true);
-            if ($already_deleted) {
-                continue;
-            }
-
-            $files = $this->get_attachment_files($id);
-            if (empty($files)) {
-                $result['skipped']++;
-                $result['errors'][] = "Attachment {$id}: no files found";
-                continue;
-            }
-
-            // Verify all files against R2 index
-            $all_verified = true;
-            foreach ($files as $file_path) {
-                $relative = ltrim(str_replace($base_dir, '', $file_path), '/');
-                $r2_key = $prefix . '/' . $relative;
-
-                if (!isset($r2_index[$r2_key])) {
-                    $all_verified = false;
-                    $result['errors'][] = "Attachment {$id}: not on R2: {$r2_key}";
-                    break;
-                }
-
-                $local_size = file_exists($file_path) ? filesize($file_path) : null;
-                if ($local_size !== null && $r2_index[$r2_key]['size'] !== $local_size) {
-                    $all_verified = false;
-                    $result['errors'][] = "Attachment {$id}: size mismatch for {$r2_key}";
-                    break;
-                }
-            }
-
-            if (!$all_verified) {
-                $result['skipped']++;
-                continue;
-            }
-
-            // Delete local files
-            $total_freed = 0;
-            $deleted_count = 0;
-            $delete_errors = false;
-
-            foreach ($files as $file_path) {
-                if (!file_exists($file_path)) {
-                    continue;
-                }
-
-                $size = filesize($file_path);
-                if (!is_writable($file_path)) {
-                    $result['errors'][] = "Attachment {$id}: not writable: {$file_path}";
-                    $delete_errors = true;
-                    continue;
-                }
-                if (unlink($file_path)) {
-                    $deleted_count++;
-                    $total_freed += $size;
-                } else {
-                    $result['errors'][] = "Attachment {$id}: failed to delete: {$file_path}";
-                    $delete_errors = true;
-                }
-            }
-
-            // Clean empty directories
-            $dir = dirname($files[0]);
-            $this->cleanup_empty_dirs($dir);
-
-            if ($delete_errors) {
-                // Record partial deletion so next run doesn't re-verify already-missing files
-                if ($deleted_count > 0) {
-                    update_post_meta($id, '_numos_r2_local_deleted', time());
-                    update_post_meta($id, '_numos_r2_local_deleted_size', $total_freed);
-                    $result['freed_bytes'] += $total_freed;
-                }
-                $result['skipped']++;
-                continue;
-            }
-
-            // Record deletion metadata
-            update_post_meta($id, '_numos_r2_local_deleted', time());
-            update_post_meta($id, '_numos_r2_local_deleted_size', $total_freed);
-
-            $result['deleted']++;
-            $result['freed_bytes'] += $total_freed;
-        }
-
-        Logger::log('info', "delete_all_local: deleted {$result['deleted']}, freed " . size_format($result['freed_bytes']) . ", skipped {$result['skipped']}");
-
-        return $result;
+        return $errors;
     }
 
     /**
-     * Delete local files for an attachment after verifying R2 copies
+     * Delete local files for an attachment after confirming each R2 copy.
      *
-     * @param int $attachment_id Attachment ID
-     * @param bool $skip_verify Skip verification (dangerous, for internal use only)
-     * @return array ['success' => bool, 'deleted_files' => int, 'freed_bytes' => int, 'errors' => [...]]
+     * @param bool $skip_verify Caller has already verified against R2 (e.g. a batch listing).
+     * @return array{success:bool,deleted_files:int,freed_bytes:int,errors:string[]}
      */
     public function delete_local_files(int $attachment_id, bool $skip_verify = false): array {
-        $result = [
-            'success' => false,
-            'deleted_files' => 0,
-            'freed_bytes' => 0,
-            'errors' => [],
-        ];
+        $result = ['success' => false, 'deleted_files' => 0, 'freed_bytes' => 0, 'errors' => []];
 
-        // Check if already deleted
-        $already_deleted = get_post_meta($attachment_id, '_numos_r2_local_deleted', true);
-        if ($already_deleted) {
-            $result['errors'][] = "Local files already deleted for attachment {$attachment_id}";
+        $manifest = $this->manifest_for($attachment_id, false, $result['errors']);
+        if ($manifest === null) {
             return $result;
         }
 
-        // Verify R2 copies first
         if (!$skip_verify) {
             $verification = $this->verify_attachment($attachment_id);
             if (!$verification['verified']) {
@@ -296,288 +166,265 @@ class LocalCleaner {
             }
         }
 
-        $local_files = $this->get_attachment_files($attachment_id);
-        if (empty($local_files)) {
-            $result['errors'][] = "No local files found for attachment {$attachment_id}";
+        $base = $this->basedir();
+
+        // Persist the intent before touching the filesystem, so a crash after an unlink never
+        // leaves a file marked as still local.
+        $targets = [];
+        foreach ($manifest['files'] as $relative => $entry) {
+            if ($entry['state'] === Manifest::STATE_LOCAL_DELETED) {
+                continue;
+            }
+            $targets[$relative] = $entry['state'];
+            $manifest['files'][$relative]['state'] = Manifest::STATE_DELETING;
+        }
+
+        if (empty($targets)) {
+            $result['success'] = true;
+            $this->refresh_deletion_markers($attachment_id, $manifest);
             return $result;
         }
 
-        $total_freed = 0;
-        $deleted_count = 0;
+        if (!Manifest::save($attachment_id, $manifest)) {
+            $result['errors'][] = 'Could not persist deletion state; aborting before deletion';
+            return $result;
+        }
+        $this->refresh_deletion_markers($attachment_id, $manifest);
 
-        foreach ($local_files as $file_path) {
-            if (!file_exists($file_path)) {
+        $freed = 0;
+        $deleted = 0;
+        $first_dir = null;
+
+        foreach ($targets as $relative => $previous_state) {
+            $path = $base . '/' . $relative;
+            if ($first_dir === null) {
+                $first_dir = dirname($path);
+            }
+
+            if (!file_exists($path)) {
+                $manifest['files'][$relative]['state'] = Manifest::STATE_LOCAL_DELETED;
+                continue;
+            }
+            // R2 was compared to the manifest, not to this file: an optimizer may have
+            // rewritten it since the upload. After an interrupted deletion it may also be
+            // another attachment's file under a reused name, so that entry stays protected.
+            if (!$this->matches_entry($path, $manifest['files'][$relative])) {
+                $result['errors'][] = "Local file differs from the stored copy: {$path}";
+                $manifest['files'][$relative]['state'] = $previous_state;
+                continue;
+            }
+            if (!is_writable($path)) {
+                $result['errors'][] = "Not writable: {$path}";
+                $manifest['files'][$relative]['state'] = Manifest::STATE_UPLOADED;
                 continue;
             }
 
-            $size = filesize($file_path);
-            if (!is_writable($file_path)) {
-                Logger::log('error', "Cannot delete local file (not writable): {$file_path}");
-                $result['errors'][] = "Not writable: {$file_path}";
-                continue;
-            }
-            if (unlink($file_path)) {
-                $deleted_count++;
-                $total_freed += $size;
+            $size = (int) filesize($path);
+            if (unlink($path)) {
+                $manifest['files'][$relative]['state'] = Manifest::STATE_LOCAL_DELETED;
+                $deleted++;
+                $freed += $size;
             } else {
-                Logger::log('error', "Failed to delete local file: {$file_path}");
-                $result['errors'][] = "Failed to delete: {$file_path}";
+                $result['errors'][] = "Failed to delete: {$path}";
+                $manifest['files'][$relative]['state'] = Manifest::STATE_UPLOADED;
             }
         }
 
-        // Clean empty year/month directories
-        if (!empty($local_files)) {
-            $dir = dirname($local_files[0]);
-            $this->cleanup_empty_dirs($dir);
+        Manifest::save($attachment_id, $manifest);
+
+        if ($first_dir !== null) {
+            $this->cleanup_empty_dirs($first_dir);
         }
 
-        if (!empty($result['errors'])) {
-            // Record partial deletion so files aren't re-processed
-            if ($deleted_count > 0) {
-                update_post_meta($attachment_id, '_numos_r2_local_deleted', time());
-                update_post_meta($attachment_id, '_numos_r2_local_deleted_size', $total_freed);
-                $result['deleted_files'] = $deleted_count;
-                $result['freed_bytes'] = $total_freed;
-            }
-            return $result;
+        $this->refresh_deletion_markers($attachment_id, $manifest);
+
+        $result['deleted_files'] = $deleted;
+        $result['freed_bytes'] = $freed;
+        $result['success'] = empty($result['errors']) && !$this->has_remaining_local($manifest);
+
+        if ($result['success']) {
+            Logger::log('info', "Deleted {$deleted} local files for attachment {$attachment_id}, freed " . size_format($freed));
         }
-
-        // Record deletion metadata
-        update_post_meta($attachment_id, '_numos_r2_local_deleted', time());
-        update_post_meta($attachment_id, '_numos_r2_local_deleted_size', $total_freed);
-
-        $result['success'] = true;
-        $result['deleted_files'] = $deleted_count;
-        $result['freed_bytes'] = $total_freed;
-
-        Logger::log('info', "Deleted {$deleted_count} local files for attachment {$attachment_id}, freed " . size_format($total_freed));
 
         return $result;
     }
 
     /**
-     * Batch delete local files for verified synced attachments
-     *
-     * @param int $batch_size Number of attachments per batch
-     * @param int $offset Offset for pagination
-     * @return array ['processed' => int, 'deleted' => int, 'freed_bytes' => int, 'errors' => [...], 'done' => bool]
+     * True while at least one file is still expected to exist locally (state uploaded).
      */
-    public function batch_delete_local(int $batch_size = 50, int $offset = 0): array {
-        $result = [
-            'processed' => 0,
-            'deleted' => 0,
-            'freed_bytes' => 0,
-            'errors' => [],
-            'done' => false,
-        ];
+    private function has_remaining_local(array $manifest): bool {
+        foreach ($manifest['files'] as $entry) {
+            if ($entry['state'] === Manifest::STATE_UPLOADED) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Keep the marker metas in step with the manifest. The marker is set as long as one file
+     * may be missing locally: it is what the restore queue and the guards of every bulk
+     * deletion read, so a partially restored or partially deleted attachment must keep it.
+     */
+    private function refresh_deletion_markers(int $attachment_id, array $manifest): void {
+        $remote_only = Manifest::remote_only($manifest);
+        if ($remote_only) {
+            update_post_meta($attachment_id, '_numos_r2_local_deleted', time());
+            update_post_meta($attachment_id, '_numos_r2_local_deleted_size', array_sum(array_column($remote_only, 'size')));
+        } else {
+            delete_post_meta($attachment_id, '_numos_r2_local_deleted');
+            delete_post_meta($attachment_id, '_numos_r2_local_deleted_size');
+        }
+    }
+
+    /**
+     * Delete local files for all synced attachments, verifying against one R2 listing.
+     *
+     * @return array{deleted:int,freed_bytes:int,skipped:int,errors:string[]}
+     */
+    public function delete_all_local(): array {
+        $result = ['deleted' => 0, 'freed_bytes' => 0, 'skipped' => 0, 'errors' => []];
 
         if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available — refusing to delete local files';
+            $result['errors'][] = 'R2 is not available; refusing to delete local files';
             return $result;
         }
 
-        $attachment_ids = $this->get_synced_with_local($batch_size, $offset);
-
-        if (empty($attachment_ids)) {
-            $result['done'] = true;
+        $index = $this->r2_client->list_all_objects(numos_r2_get_site_prefix() . '/');
+        if (empty($index)) {
+            $result['errors'][] = 'R2 index is empty or could not be listed; refusing to delete local files';
             return $result;
         }
 
-        foreach ($attachment_ids as $id) {
-            $result['processed']++;
-            $del = $this->delete_local_files($id);
+        foreach ($this->get_synced_with_local(999999, 0) as $id) {
+            $manifest = Manifest::get($id);
+            if ($manifest === null) {
+                $result['skipped']++;
+                continue;
+            }
 
+            $errors = $this->verify_against_index($manifest, $index);
+            if (!empty($errors)) {
+                $result['skipped']++;
+                $result['errors'][] = "Attachment {$id}: " . $errors[0];
+                continue;
+            }
+
+            $del = $this->delete_local_files($id, true);
             if ($del['success']) {
                 $result['deleted']++;
                 $result['freed_bytes'] += $del['freed_bytes'];
             } else {
+                $result['skipped']++;
                 foreach ($del['errors'] as $err) {
                     $result['errors'][] = "Attachment {$id}: {$err}";
                 }
             }
         }
 
+        Logger::log('info', "delete_all_local: deleted {$result['deleted']}, freed " . size_format($result['freed_bytes']) . ", skipped {$result['skipped']}");
         return $result;
     }
 
     /**
-     * Restore a single attachment from R2 to local filesystem
+     * @return array{processed:int,deleted:int,freed_bytes:int,errors:string[],done:bool}
+     */
+    public function batch_delete_local(int $batch_size = 50, int $offset = 0): array {
+        return $this->run_batch(
+            $this->get_synced_with_local($batch_size, $offset),
+            'R2 is not available; refusing to delete local files',
+            [$this, 'delete_local_files'],
+            'deleted',
+            ['freed_bytes']
+        );
+    }
+
+    /**
+     * Restore an attachment's files from R2 to the local filesystem (atomic + verified).
      *
-     * @param int $attachment_id Attachment ID
-     * @return array ['success' => bool, 'restored_files' => int, 'errors' => [...]]
+     * @return array{success:bool,restored_files:int,errors:string[]}
      */
     public function restore_from_r2(int $attachment_id): array {
-        $result = [
-            'success' => false,
-            'restored_files' => 0,
-            'errors' => [],
-        ];
+        $result = ['success' => false, 'restored_files' => 0, 'errors' => []];
 
-        $status = get_post_meta($attachment_id, '_numos_r2_status', true);
-        if ($status !== 'synced') {
-            $result['errors'][] = "Attachment {$attachment_id} is not synced";
+        $manifest = $this->manifest_for($attachment_id, true, $result['errors']);
+        if ($manifest === null) {
             return $result;
         }
 
-        if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available';
-            return $result;
-        }
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-        $prefix = numos_r2_get_site_prefix();
-
-        // Get all expected files
-        $local_files = $this->get_attachment_files($attachment_id);
-        if (empty($local_files)) {
-            $result['errors'][] = "Cannot determine file paths for attachment {$attachment_id}";
-            return $result;
-        }
-
+        $base = $this->basedir();
         $restored = 0;
+        $ok = true;
 
-        foreach ($local_files as $file_path) {
-            if (file_exists($file_path)) {
-                $restored++; // Already exists locally
+        foreach ($manifest['files'] as $relative => $entry) {
+            $path = $base . '/' . $relative;
+            // A file never deleted is the reference copy. Any other file is never written over:
+            // WordPress hands a freed name to the next upload, so it may be another
+            // attachment's only copy.
+            $kept = file_exists($path) && ($entry['state'] === Manifest::STATE_UPLOADED || $this->matches_entry($path, $entry));
+            if ($kept || (!file_exists($path) && $this->r2_client->get_object($entry['key'], $path, $entry['md5']))) {
+                $manifest['files'][$relative]['state'] = Manifest::STATE_UPLOADED;
+                $restored++;
                 continue;
             }
-
-            $relative = ltrim(str_replace($base_dir, '', $file_path), '/');
-            $r2_key = $prefix . '/' . $relative;
-
-            // Ensure directory exists
-            $dir = dirname($file_path);
-            if (!file_exists($dir)) {
-                wp_mkdir_p($dir);
-            }
-
-            if ($this->r2_client->get_object($r2_key, $file_path)) {
-                $restored++;
-                Logger::log('info', "Restored file from R2: {$r2_key}");
-            } else {
-                $result['errors'][] = "Failed to download: {$r2_key}";
-            }
+            $result['errors'][] = file_exists($path)
+                ? "A different file already exists, left in place: {$path}"
+                : "Failed to download: {$entry['key']}";
+            $ok = false;
         }
 
-        if (empty($result['errors'])) {
-            // Clear deletion metadata
-            delete_post_meta($attachment_id, '_numos_r2_local_deleted');
-            delete_post_meta($attachment_id, '_numos_r2_local_deleted_size');
-            $result['success'] = true;
-        }
+        Manifest::save($attachment_id, $manifest);
+        $this->refresh_deletion_markers($attachment_id, $manifest);
 
         $result['restored_files'] = $restored;
-
-        Logger::log('info', "Restored {$restored} files for attachment {$attachment_id}");
-
+        $result['success'] = $ok;
+        if ($ok) {
+            Logger::log('info', "Restored {$restored} files for attachment {$attachment_id}");
+        }
         return $result;
     }
 
     /**
-     * Restore all R2-only attachments to local filesystem in a single call
-     *
-     * @return array ['restored' => int, 'skipped' => int, 'errors' => [...]]
-     */
-    public function restore_all(): array {
-        $result = ['restored' => 0, 'skipped' => 0, 'errors' => []];
-
-        if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available';
-            return $result;
-        }
-
-        $attachment_ids = $this->get_r2_only_attachments(999999);
-
-        if (empty($attachment_ids)) {
-            return $result;
-        }
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-        $prefix = numos_r2_get_site_prefix();
-
-        foreach ($attachment_ids as $id) {
-            $local_files = $this->get_attachment_files($id);
-            if (empty($local_files)) {
-                $result['skipped']++;
-                $result['errors'][] = "Attachment {$id}: cannot determine file paths";
-                continue;
-            }
-
-            $restored = 0;
-            $has_error = false;
-
-            foreach ($local_files as $file_path) {
-                if (file_exists($file_path)) {
-                    $restored++;
-                    continue;
-                }
-
-                $relative = ltrim(str_replace($base_dir, '', $file_path), '/');
-                $r2_key = $prefix . '/' . $relative;
-
-                $dir = dirname($file_path);
-                if (!file_exists($dir)) {
-                    wp_mkdir_p($dir);
-                }
-
-                if ($this->r2_client->get_object($r2_key, $file_path)) {
-                    $restored++;
-                } else {
-                    $result['errors'][] = "Attachment {$id}: failed to download {$r2_key}";
-                    $has_error = true;
-                }
-            }
-
-            if (!$has_error) {
-                delete_post_meta($id, '_numos_r2_local_deleted');
-                delete_post_meta($id, '_numos_r2_local_deleted_size');
-                $result['restored']++;
-            } else {
-                $result['skipped']++;
-            }
-        }
-
-        Logger::log('info', "restore_all: restored {$result['restored']}, skipped {$result['skipped']}");
-
-        return $result;
-    }
-
-    /**
-     * Batch restore from R2
-     *
-     * @param int $batch_size Number of attachments per batch
-     * @return array ['processed' => int, 'restored' => int, 'errors' => [...], 'done' => bool]
+     * @return array{processed:int,restored:int,errors:string[],done:bool}
      */
     public function batch_restore_from_r2(int $batch_size = 50): array {
-        $result = [
-            'processed' => 0,
-            'restored' => 0,
-            'errors' => [],
-            'done' => false,
-        ];
+        return $this->run_batch(
+            $this->get_r2_only_attachments($batch_size),
+            'R2 is not available',
+            [$this, 'restore_from_r2'],
+            'restored'
+        );
+    }
+
+    /**
+     * Run $process on each attachment of a batch: $count tallies the successes, and each field
+     * in $sums adds up across their results.
+     *
+     * @param callable $process fn(int $id): array{success:bool,errors:string[]}
+     */
+    private function run_batch(array $ids, string $unavailable, callable $process, string $count, array $sums = []): array {
+        $result = ['processed' => 0, $count => 0] + array_fill_keys($sums, 0) + ['errors' => [], 'done' => false];
 
         if (!$this->r2_client->is_available()) {
-            $result['errors'][] = 'R2 is not available';
+            $result['errors'][] = $unavailable;
             return $result;
         }
 
-        $attachment_ids = $this->get_r2_only_attachments($batch_size);
-
-        if (empty($attachment_ids)) {
+        if (empty($ids)) {
             $result['done'] = true;
             return $result;
         }
 
-        foreach ($attachment_ids as $id) {
+        foreach ($ids as $id) {
             $result['processed']++;
-            $restore = $this->restore_from_r2($id);
-
-            if ($restore['success']) {
-                $result['restored']++;
+            $outcome = $process($id);
+            if ($outcome['success']) {
+                $result[$count]++;
+                foreach ($sums as $field) {
+                    $result[$field] += $outcome[$field];
+                }
             } else {
-                foreach ($restore['errors'] as $err) {
+                foreach ($outcome['errors'] as $err) {
                     $result['errors'][] = "Attachment {$id}: {$err}";
                 }
             }
@@ -587,39 +434,126 @@ class LocalCleaner {
     }
 
     /**
-     * Get storage savings data
+     * One-time backfill of the media offloaded by the first release, whose keys are
+     * tenant/<relative path>: builds a manifest from the R2 listing for every attachment that
+     * carries offload metadata but no manifest. Keys of the current scheme always get their
+     * manifest at upload time.
      *
-     * @return array ['freed_bytes' => int, 'freed_human' => string, 'r2_only_count' => int, 'total_r2_size' => int, 'total_r2_size_human' => string]
+     * @return array{synced:int,partial:int,skipped:int,total:int,r2_files?:int,error?:string}
+     */
+    public function sync_from_r2(): array {
+        $result = ['synced' => 0, 'partial' => 0, 'skipped' => 0, 'total' => 0];
+
+        if (!$this->r2_client->is_available()) {
+            $result['error'] = __('R2 is not available. Check your connection settings.', 'numos-r2');
+            return $result;
+        }
+
+        $prefix = numos_r2_get_site_prefix();
+        $index = $this->r2_client->list_all_objects($prefix . '/');
+        if ($index === null) {
+            $result['error'] = __('Could not list the objects in storage. Nothing was changed.', 'numos-r2');
+            return $result;
+        }
+        if (empty($index)) {
+            $result['error'] = sprintf(
+                __('No files found on R2 under prefix "%s/".', 'numos-r2'),
+                $prefix
+            );
+            return $result;
+        }
+        $result['r2_files'] = count($index);
+
+        $base = $this->basedir();
+
+        foreach ($this->backfill_candidates() as $id) {
+            $built = $this->reconstruct_legacy_manifest($id, $index, $prefix, $base);
+            if ($built === null) {
+                $result['skipped']++;
+                continue;
+            }
+            $result['total']++;
+
+            $status = $built['complete'] ? 'synced' : 'partial';
+            $result[$status]++;
+            Manifest::save($id, $built['manifest']);
+            update_post_meta($id, '_numos_r2_status', $status);
+            update_post_meta($id, '_numos_r2_synced', time());
+            if ($built['main_key'] !== null) {
+                update_post_meta($id, '_numos_r2_url', $this->r2_client->get_public_url($built['main_key']));
+            }
+            $this->refresh_deletion_markers($id, $built['manifest']);
+        }
+
+        UrlRewriter::forget_map();
+        Logger::log('info', "sync_from_r2: synced {$result['synced']}, partial {$result['partial']}, skipped {$result['skipped']}");
+        return $result;
+    }
+
+    /**
+     * Manifest of one attachment from the R2 listing, with the files found under their
+     * first-release keys, or null when none is there.
+     *
+     * @return array{manifest:array,main_key:?string,complete:bool}|null
+     */
+    private function reconstruct_legacy_manifest(int $attachment_id, array $index, string $prefix, string $base): ?array {
+        $keys = Manifest::legacy_keys($attachment_id, $prefix, $base);
+        $manifest = ['v' => Manifest::SCHEMA, 'files' => []];
+        // Once the first release removed the local copies, a file at one of these paths may be
+        // another upload under a reused name: it counts as the local copy only if identical.
+        $deleted_before = get_post_meta($attachment_id, '_numos_r2_local_deleted', true) !== '';
+
+        foreach ($keys as $relative => $key) {
+            if (!isset($index[$key])) {
+                continue;
+            }
+            $path = $base . '/' . $relative;
+            $etag = $index[$key]['etag'];
+            $entry = Manifest::entry(
+                $key,
+                (int) $index[$key]['size'],
+                (strpos($etag, '-') === false) ? $etag : '',
+                R2Client::mime_type($path),
+                Manifest::STATE_LOCAL_DELETED
+            );
+            if (file_exists($path) && (!$deleted_before || $this->matches_entry($path, $entry))) {
+                $entry['state'] = Manifest::STATE_UPLOADED;
+            }
+            $manifest['files'][$relative] = $entry;
+        }
+
+        if (empty($manifest['files'])) {
+            return null;
+        }
+
+        $main = array_key_first($keys);
+        return [
+            'manifest' => $manifest,
+            'main_key' => isset($manifest['files'][$main]) ? $keys[$main] : null,
+            'complete' => count($manifest['files']) === count($keys),
+        ];
+    }
+
+    /**
+     * Storage savings for the dashboard.
+     *
+     * @return array{freed_bytes:int,freed_human:string,r2_only_count:int,synced_count:int}
      */
     public function get_savings(): array {
         global $wpdb;
 
-        // Total freed bytes
-        $freed = $wpdb->get_var($wpdb->prepare(
-            "SELECT COALESCE(SUM(CAST(meta_value AS UNSIGNED)), 0)
-            FROM {$wpdb->postmeta}
-            WHERE meta_key = %s",
+        $freed = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COALESCE(SUM(CAST(meta_value AS UNSIGNED)), 0) FROM {$wpdb->postmeta} WHERE meta_key = %s",
             '_numos_r2_local_deleted_size'
         ));
-        $freed = (int)$freed;
-
-        // R2-only count
-        $r2_only = $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(DISTINCT post_id)
-            FROM {$wpdb->postmeta}
-            WHERE meta_key = %s",
+        $r2_only = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = %s",
             '_numos_r2_local_deleted'
         ));
-        $r2_only = (int)$r2_only;
-
-        // Total synced count
-        $synced = $wpdb->get_var($wpdb->prepare(
-            "SELECT COUNT(DISTINCT post_id)
-            FROM {$wpdb->postmeta}
-            WHERE meta_key = '_numos_r2_status' AND meta_value = %s",
+        $synced = (int) $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_numos_r2_status' AND meta_value = %s",
             'synced'
         ));
-        $synced = (int)$synced;
 
         return [
             'freed_bytes' => $freed,
@@ -630,195 +564,32 @@ class LocalCleaner {
     }
 
     /**
-     * Sync database from R2: scan R2 index and mark unsynced attachments whose files are all present on R2
-     *
-     * @return array ['synced' => int, 'partial' => int, 'skipped' => int, 'total' => int]
-     */
-    public function sync_from_r2(): array {
-        $result = ['synced' => 0, 'partial' => 0, 'skipped' => 0, 'total' => 0];
-
-        if (!$this->r2_client->is_available()) {
-            Logger::log('error', 'sync_from_r2: R2 is not available');
-            $result['error'] = __('R2 is not available. Check your connection settings.', 'numos-r2');
-            return $result;
-        }
-
-        // 1. Build R2 index
-        $prefix = numos_r2_get_site_prefix();
-        Logger::log('info', "sync_from_r2: scanning R2 with prefix '{$prefix}/'");
-        $r2_index = $this->r2_client->list_all_objects($prefix . '/');
-
-        if (empty($r2_index)) {
-            Logger::log('warning', "sync_from_r2: no files found on R2 under prefix '{$prefix}/'");
-            $result['error'] = sprintf(
-                __('No files found on R2 under prefix "%s/". Check that your files are stored under this prefix.', 'numos-r2'),
-                $prefix
-            );
-            return $result;
-        }
-
-        $result['r2_files'] = count($r2_index);
-        Logger::log('info', "sync_from_r2: found " . count($r2_index) . " files on R2");
-
-        // 2. Load all attachment IDs that are NOT already synced
-        global $wpdb;
-        $attachment_ids = array_map('intval', $wpdb->get_col(
-            "SELECT p.ID FROM {$wpdb->posts} p
-             LEFT JOIN {$wpdb->postmeta} pm
-                 ON p.ID = pm.post_id
-                 AND pm.meta_key = '_numos_r2_status'
-                 AND pm.meta_value = 'synced'
-             WHERE p.post_type = 'attachment'
-             AND p.post_status = 'inherit'
-             AND pm.post_id IS NULL"
-        ));
-
-        $result['total'] = count($attachment_ids);
-
-        if (empty($attachment_ids)) {
-            return $result;
-        }
-
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-
-        // 3. Check each attachment against R2 index
-        foreach ($attachment_ids as $id) {
-            $files = $this->get_attachment_files($id);
-            if (empty($files)) {
-                $result['skipped']++;
-                continue;
-            }
-
-            // First file is the main file
-            $main_path = $files[0];
-            $main_relative = ltrim(str_replace($base_dir, '', $main_path), '/');
-            $main_r2_key = $prefix . '/' . $main_relative;
-
-            // Check if main file exists on R2
-            if (!isset($r2_index[$main_r2_key])) {
-                $result['skipped']++;
-                continue;
-            }
-
-            // Check thumbnails
-            $thumbs_total = count($files) - 1;
-            $thumbs_found = 0;
-
-            for ($i = 1; $i < count($files); $i++) {
-                $relative = ltrim(str_replace($base_dir, '', $files[$i]), '/');
-                $r2_key = $prefix . '/' . $relative;
-                if (isset($r2_index[$r2_key])) {
-                    $thumbs_found++;
-                }
-            }
-
-            if ($thumbs_total === 0 || $thumbs_found === $thumbs_total) {
-                // All files present on R2 — mark as synced
-                update_post_meta($id, '_numos_r2_status', 'synced');
-                update_post_meta($id, '_numos_r2_synced', time());
-                update_post_meta($id, '_numos_r2_key', $main_r2_key);
-                update_post_meta($id, '_numos_r2_url', $this->r2_client->get_public_url($main_r2_key));
-
-                // If local file doesn't exist, also mark as local deleted
-                if (!file_exists($main_path)) {
-                    update_post_meta($id, '_numos_r2_local_deleted', time());
-                    // Estimate size from R2 index
-                    $total_size = $r2_index[$main_r2_key]['size'];
-                    for ($i = 1; $i < count($files); $i++) {
-                        $relative = ltrim(str_replace($base_dir, '', $files[$i]), '/');
-                        $r2_key = $prefix . '/' . $relative;
-                        if (isset($r2_index[$r2_key])) {
-                            $total_size += $r2_index[$r2_key]['size'];
-                        }
-                    }
-                    update_post_meta($id, '_numos_r2_local_deleted_size', $total_size);
-                }
-
-                $result['synced']++;
-            } else {
-                // Main OK but some thumbs missing
-                $result['partial']++;
-                Logger::log('warning', "sync_from_r2: attachment {$id} partial — {$thumbs_found}/{$thumbs_total} thumbnails found on R2");
-            }
-        }
-
-        Logger::log('info', "sync_from_r2: synced {$result['synced']}, partial {$result['partial']}, skipped {$result['skipped']} of {$result['total']} attachments");
-
-        if ($result['synced'] > 0) {
-            delete_transient('numos_r2_synced_paths');
-        }
-
-        return $result;
-    }
-
-    /**
-     * Get all file paths for an attachment (main + thumbnails + original)
-     *
-     * @param int $attachment_id Attachment ID
-     * @return array File paths
-     */
-    public function get_attachment_files(int $attachment_id): array {
-        $files = [];
-
-        $local_path = get_attached_file($attachment_id);
-        if (!$local_path) {
-            return $files;
-        }
-
-        $files[] = $local_path;
-        $base_dir = dirname($local_path);
-
-        $metadata = wp_get_attachment_metadata($attachment_id);
-
-        if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
-            foreach ($metadata['sizes'] as $size_data) {
-                $thumb_path = $base_dir . '/' . $size_data['file'];
-                $files[] = $thumb_path;
-            }
-        }
-
-        if (!empty($metadata['original_image'])) {
-            $files[] = $base_dir . '/' . $metadata['original_image'];
-        }
-
-        return array_unique($files);
-    }
-
-    /**
-     * Get synced attachments that still have local files (not yet deleted)
-     *
-     * @param int $limit Number of items
-     * @param int $offset Offset
-     * @return array Attachment IDs
+     * @return int[]
      */
     public function get_synced_with_local(int $limit = 50, int $offset = 0): array {
         global $wpdb;
 
-        return array_map('intval', $wpdb->get_col($wpdb->prepare("
-            SELECT DISTINCT pm_status.post_id
-            FROM {$wpdb->postmeta} pm_status
-            LEFT JOIN {$wpdb->postmeta} pm_deleted
-                ON pm_status.post_id = pm_deleted.post_id
-                AND pm_deleted.meta_key = '_numos_r2_local_deleted'
-            WHERE pm_status.meta_key = '_numos_r2_status'
-            AND pm_status.meta_value = 'synced'
-            AND pm_deleted.meta_value IS NULL
-            ORDER BY pm_status.post_id ASC
-            LIMIT %d OFFSET %d
-        ", $limit, $offset)));
+        return array_map('intval', $wpdb->get_col($wpdb->prepare(
+            'SELECT DISTINCT pm_status.post_id ' . $this->synced_with_local_clauses()
+            . ' ORDER BY pm_status.post_id ASC LIMIT %d OFFSET %d',
+            $limit, $offset
+        )));
     }
 
-    /**
-     * Count synced attachments that still have local files
-     *
-     * @return int
-     */
     public function count_synced_with_local(): int {
         global $wpdb;
 
-        return (int)$wpdb->get_var($wpdb->prepare("
-            SELECT COUNT(DISTINCT pm_status.post_id)
+        return (int) $wpdb->get_var('SELECT COUNT(DISTINCT pm_status.post_id) ' . $this->synced_with_local_clauses());
+    }
+
+    /**
+     * FROM and WHERE clauses selecting the synced attachments without the deletion marker:
+     * every file is expected locally.
+     */
+    private function synced_with_local_clauses(): string {
+        global $wpdb;
+
+        return $wpdb->prepare("
             FROM {$wpdb->postmeta} pm_status
             LEFT JOIN {$wpdb->postmeta} pm_deleted
                 ON pm_status.post_id = pm_deleted.post_id
@@ -826,21 +597,20 @@ class LocalCleaner {
             WHERE pm_status.meta_key = %s
             AND pm_status.meta_value = %s
             AND pm_deleted.meta_value IS NULL
-        ", '_numos_r2_local_deleted', '_numos_r2_status', 'synced'));
+        ", '_numos_r2_local_deleted', '_numos_r2_status', 'synced');
     }
 
     /**
-     * Get attachments that are R2-only (local deleted)
+     * Attachments with the deletion marker, at least one file possibly only on R2: the restore
+     * queue.
      *
-     * @param int $limit Number of items
-     * @return array Attachment IDs
+     * @return int[]
      */
     public function get_r2_only_attachments(int $limit = 50): array {
         global $wpdb;
 
         return array_map('intval', $wpdb->get_col($wpdb->prepare("
-            SELECT DISTINCT post_id
-            FROM {$wpdb->postmeta}
+            SELECT DISTINCT post_id FROM {$wpdb->postmeta}
             WHERE meta_key = '_numos_r2_local_deleted'
             ORDER BY post_id ASC
             LIMIT %d
@@ -848,32 +618,99 @@ class LocalCleaner {
     }
 
     /**
-     * Clean up empty year/month directories after file deletion
+     * Attachments without a manifest that the first release offloaded, whatever their status
+     * (it served R2 URLs for partial uploads too).
      *
-     * @param string $dir Directory to check
+     * @return int[]
+     */
+    private function backfill_candidates(): array {
+        global $wpdb;
+
+        $ids = array_map('intval', $wpdb->get_col($wpdb->prepare("
+            SELECT DISTINCT p.ID
+            FROM {$wpdb->posts} p
+            INNER JOIN {$wpdb->postmeta} pm
+                ON p.ID = pm.post_id AND pm.meta_key LIKE %s
+            LEFT JOIN {$wpdb->postmeta} pm_man
+                ON p.ID = pm_man.post_id AND pm_man.meta_key = %s
+            WHERE p.post_type = 'attachment'
+            AND pm_man.post_id IS NULL
+            ORDER BY p.ID ASC
+        ", $wpdb->esc_like('_numos_r2_') . '%', Manifest::META_KEY)));
+
+        update_meta_cache('post', $ids);
+        return array_values(array_filter($ids, [Manifest::class, 'has_trace']));
+    }
+
+    /**
+     * Every R2 key in use, as a key => true set, so the orphan scan can tell a genuinely
+     * orphaned object of this tenant from a live one: the keys of every manifest, plus the
+     * first-release keys of every attachment that has no manifest yet.
+     *
+     * @return array<string,bool>
+     */
+    public function all_referenced_keys(): array {
+        global $wpdb;
+
+        $keys = [];
+        foreach ($this->all_manifests() as $manifest) {
+            $keys += array_fill_keys(Manifest::keys($manifest), true);
+        }
+
+        $without_manifest = array_map('intval', $wpdb->get_col($wpdb->prepare("
+            SELECT p.ID
+            FROM {$wpdb->posts} p
+            LEFT JOIN {$wpdb->postmeta} pm_man
+                ON p.ID = pm_man.post_id AND pm_man.meta_key = %s
+            WHERE p.post_type = 'attachment'
+            AND pm_man.post_id IS NULL
+        ", Manifest::META_KEY)));
+        update_meta_cache('post', $without_manifest);
+
+        $prefix = numos_r2_get_site_prefix();
+        $base = $this->basedir();
+        foreach ($without_manifest as $id) {
+            $keys += array_fill_keys(Manifest::legacy_keys($id, $prefix, $base), true);
+        }
+        return $keys;
+    }
+
+    /**
+     * Every attachment manifest, keyed by attachment ID.
+     *
+     * @return array<int,array>
+     */
+    private function all_manifests(): array {
+        global $wpdb;
+
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s",
+            Manifest::META_KEY
+        ));
+
+        $out = [];
+        foreach ($rows as $row) {
+            $manifest = maybe_unserialize($row->meta_value);
+            if (is_array($manifest) && !empty($manifest['files'])) {
+                $out[(int) $row->post_id] = $manifest;
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Remove empty year/month directories after deletion, never above the uploads base.
      */
     private function cleanup_empty_dirs(string $dir): void {
-        $upload_dir = wp_upload_dir();
-        $base_dir = $upload_dir['basedir'];
-
-        // Don't go above uploads base dir
-        if (strlen($dir) <= strlen($base_dir)) {
+        $base_dir = $this->basedir();
+        if (strlen($dir) <= strlen($base_dir) || !is_dir($dir)) {
             return;
         }
 
-        // Check if directory is empty
-        if (!is_dir($dir)) {
-            return;
-        }
-
-        $files = array_diff(scandir($dir), ['.', '..']);
-        if (empty($files)) {
+        $entries = array_diff(scandir($dir), ['.', '..']);
+        if (empty($entries)) {
             @rmdir($dir);
-            Logger::log('debug', "Removed empty directory: {$dir}");
-
-            // Try parent (e.g., year directory)
-            $parent = dirname($dir);
-            $this->cleanup_empty_dirs($parent);
+            $this->cleanup_empty_dirs(dirname($dir));
         }
     }
 }

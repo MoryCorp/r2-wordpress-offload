@@ -1,7 +1,5 @@
 /**
- * Numos R2 Media Offload — Media Library Grid View Badges
- *
- * Adds R2 status overlay badges to attachment thumbnails in grid view.
+ * R2 status badges on attachment thumbnails in the Media Library grid view.
  */
 (function ($) {
     'use strict';
@@ -19,13 +17,13 @@
         }
 
         if (data.s === 'synced' && data.d) {
-            return { label: 'R2', cls: 'numos-r2-grid-badge-r2only' };
+            return { label: 'Cloud', cls: 'numos-r2-grid-badge-r2only' };
         }
         if (data.s === 'synced') {
-            return { label: 'R2', cls: 'numos-r2-grid-badge-synced' };
+            return { label: 'Cloud', cls: 'numos-r2-grid-badge-synced' };
         }
         if (data.s === 'partial') {
-            return { label: 'R2~', cls: 'numos-r2-grid-badge-partial' };
+            return { label: 'Cloud~', cls: 'numos-r2-grid-badge-partial' };
         }
         return null;
     }
@@ -59,11 +57,10 @@
         });
     }
 
-    // Run on initial load and observe DOM changes for infinite scroll / AJAX pagination
     $(document).ready(function () {
         applyBadges();
 
-        // Re-apply when new attachments are loaded (grid uses Backbone views)
+        // The grid adds attachments as they load (Backbone views): re-apply on each change.
         if (typeof MutationObserver !== 'undefined') {
             var container = document.querySelector('.attachments');
             if (container) {

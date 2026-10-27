@@ -2,9 +2,9 @@
 Contributors: numos
 Tags: cloudflare, r2, media, offload, storage, cdn
 Requires at least: 5.8
-Tested up to: 6.9
+Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.0.0
+Stable tag: 2.0.0
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 
@@ -26,11 +26,11 @@ request signing.
 * Intelligent URL rewriting: attachment URLs, srcset, post content, ACF fields,
   Elementor data attributes, and full HTML output buffer
 * Per-site prefix for multi-site or multi-tenant buckets
-* Integrity verification (MD5/ETag) after each upload
+* Integrity verification (MD5/ETag) after each upload, recorded in a per-attachment manifest
 * Retry logic with exponential backoff
 * Local file cleanup after R2 verification (optional)
 * Restore from R2 to local filesystem
-* Database reconciliation (sync-from-r2)
+* Manifest backfill for media offloaded by 1.x (sync-from-r2)
 * Orphan file detection (R2 and database)
 * WP-CLI commands for all operations
 * Admin dashboard with real-time progress, logs, and storage savings
@@ -93,10 +93,10 @@ Option B - Cloudflare Worker or CDN:
     wp numos-r2 migrate                 # Migrate all media to R2
     wp numos-r2 migrate --dry-run       # Preview what would be migrated
     wp numos-r2 verify                  # Verify all synced files on R2
-    wp numos-r2 verify --fix            # Re-upload missing/broken files
+    wp numos-r2 verify --fix            # Re-upload faulty attachments that have a manifest
     wp numos-r2 delete-local --yes      # Delete verified local copies
     wp numos-r2 restore --yes           # Restore all files from R2
-    wp numos-r2 sync-from-r2            # Reconcile DB with R2 contents
+    wp numos-r2 sync-from-r2            # Build manifests for media offloaded by 1.x
     wp numos-r2 delete-r2 --yes         # Delete all files from R2
 
 == Frequently Asked Questions ==
@@ -104,13 +104,16 @@ Option B - Cloudflare Worker or CDN:
 = Will this delete my local files? =
 
 Not by default. Local file deletion is opt-in via the "Remove Local Files"
-setting or the `wp numos-r2 delete-local` command. Each file is verified on R2
-(HEAD + size check) before local deletion.
+setting or the `wp numos-r2 delete-local` command. A local file is deleted only
+when its R2 object and the file itself both match the size and MD5 recorded in
+the manifest.
 
 = What happens if R2 is down? =
 
-The plugin checks R2 availability before rewriting URLs. If R2 is unreachable,
-URLs fall back to local paths. Health status is cached (60s up, 30s down).
+Media keep their R2 URLs: the public CDN serves them independently of the R2
+API, and local copies may have been deleted. Operations that need the API
+(uploads, verification, deletion, restore) wait until it answers again. Health
+status is cached (60s up, 30s down).
 
 = Does it work with page builders? =
 
@@ -135,6 +138,17 @@ format `md5-N`) skip the MD5 check as they use a different checksum format.
 
 == Changelog ==
 
+= 2.0.0 =
+* Per-attachment manifest of the uploaded files (key, size, MD5, state), read by
+  URL rewriting, verification, deletion and restore
+* New keys `prefix/<version>/YYYY/MM/name.ext`: a new upload never overwrites or
+  shares another attachment's objects
+* Local deletion checks the local file against the manifest; restore never
+  overwrites a different file and downloads atomically
+* Orphan tools limited to this site's prefix, media offloaded by 1.x protected
+* Uninstall keeps the storage metadata
+* `sync-from-r2` builds the manifests of media offloaded by 1.x
+
 = 1.0.0 =
 * Initial public release
 * Parallel uploads with curl_multi (configurable concurrency)
@@ -154,6 +168,11 @@ format `md5-N`) skip the MD5 check as they use a different checksum format.
 * Batch processing with configurable batch size
 
 == Upgrade Notice ==
+
+= 2.0.0 =
+Replace the plugin files, never uninstall 1.x: its uninstall deletes the storage
+metadata. Then run `wp numos-r2 sync-from-r2` and purge page caches: until the
+manifests are built, media offloaded by 1.x are served from their local URLs.
 
 = 1.0.0 =
 Initial release.

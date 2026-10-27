@@ -1,6 +1,3 @@
-/**
- * Numos R2 Media Offload - Admin JavaScript
- */
 (function($) {
     'use strict';
 
@@ -24,7 +21,6 @@
         },
 
         bindEvents: function() {
-            // Existing
             $('#numos-r2-test-connection').on('click', this.testConnection.bind(this));
             $('#numos-r2-start-migration').on('click', this.startMigration.bind(this));
             $('#numos-r2-reset-failed').on('click', this.resetFailed.bind(this));
@@ -36,7 +32,6 @@
             $('#numos-r2-scan-db-orphans').on('click', this.scanDbOrphans.bind(this));
             $('#numos-r2-delete-db-orphans').on('click', this.deleteDbOrphans.bind(this));
 
-            // New
             $('#numos-r2-delete-local').on('click', this.startDeleteLocal.bind(this));
             $('#numos-r2-verify-files').on('click', this.startVerify.bind(this));
             $('#numos-r2-restore-r2').on('click', this.startRestore.bind(this));
@@ -328,7 +323,6 @@
                     const result = data.result;
                     const totalDuration = self.formatDuration(Date.now() - startTime);
 
-                    // Update progress bar to 100%
                     $('#numos-r2-delete-local-bar').css('width', '100%');
                     $('#numos-r2-delete-local-text').text(
                         result.deleted + ' deleted, ' +
@@ -336,7 +330,6 @@
                     );
                     $('#numos-r2-local-eligible').text(data.remaining);
 
-                    // Update savings
                     if (data.savings) {
                         $('#numos-r2-savings-freed').text(data.savings.freed_human);
                         $('#numos-r2-savings-r2only').text(data.savings.r2_only_count);
@@ -635,7 +628,6 @@
                 'success'
             );
 
-            // Refresh counters
             $('#numos-r2-synced-count').text('0');
             $('#numos-r2-pending-count').text($('#numos-r2-synced-count').closest('.numos-r2-cards').find('.numos-r2-stat-number').first().text());
             $('#numos-r2-r2-file-count').text('0');
@@ -697,7 +689,7 @@
             }).catch(function(err) {
                 var msg = 'Request failed';
                 if (err && err.status === 'timeout') {
-                    msg = 'Request timed out. Your R2 bucket may be very large — try using WP-CLI: wp numos-r2 sync-from-r2';
+                    msg = 'Request timed out. Your storage bucket may be very large; try using WP-CLI: wp numos-r2 sync-from-r2';
                 }
                 self.showNotice(msg, 'error');
                 $summary.html('<p class="numos-r2-error">' + self.escHtml(msg) + '</p>');
@@ -706,22 +698,33 @@
             });
         },
 
-        // ==================== EXISTING HANDLERS ==================== //
+        // ==================== MAINTENANCE ==================== //
 
         resetFailed: function(e) {
             e.preventDefault();
+            this.postAction('resetFailed', 'numos_r2_reset_failed', $(e.currentTarget));
+        },
 
+        purgeMeta: function(e) {
+            e.preventDefault();
+
+            if (!confirm(numosR2.strings.confirmPurge)) return;
+
+            this.postAction('purgeMeta', 'numos_r2_purge_meta', $(e.currentTarget));
+        },
+
+        // Admin action answered with a message and the new progress.
+        postAction: function(key, action, $button) {
             const self = this;
-            const $button = $(e.currentTarget);
 
-            this.executeOnce('resetFailed', function() {
+            this.executeOnce(key, function() {
                 $button.addClass('loading').prop('disabled', true);
 
                 return self.fetchWithRetry({
                     url: numosR2.ajaxUrl,
                     type: 'POST',
                     data: {
-                        action: 'numos_r2_reset_failed',
+                        action: action,
                         nonce: numosR2.nonce
                     }
                 }).then(function(response) {
@@ -797,13 +800,11 @@
 
             $('#numos-r2-start-migration').prop('disabled', progress.pending === 0);
 
-            // Update delete local section
             if (data.synced_with_local !== undefined) {
                 $('#numos-r2-local-eligible').text(data.synced_with_local);
                 $('#numos-r2-delete-local').prop('disabled', data.synced_with_local === 0);
             }
 
-            // Update savings & restore section
             if (data.savings) {
                 $('#numos-r2-savings-size').text(data.savings.human_size);
                 $('#numos-r2-savings-r2only').text(data.savings.r2_only_count);
@@ -885,39 +886,6 @@
 
             $log.append(document.createTextNode(timestamp + ' ' + prefix + ' ' + message + '\n'));
             $log.scrollTop($log[0].scrollHeight);
-        },
-
-        purgeMeta: function(e) {
-            e.preventDefault();
-
-            if (!confirm(numosR2.strings.confirmPurge)) return;
-
-            const self = this;
-            const $button = $(e.currentTarget);
-
-            this.executeOnce('purgeMeta', function() {
-                $button.addClass('loading').prop('disabled', true);
-
-                return self.fetchWithRetry({
-                    url: numosR2.ajaxUrl,
-                    type: 'POST',
-                    data: {
-                        action: 'numos_r2_purge_meta',
-                        nonce: numosR2.nonce
-                    }
-                }).then(function(response) {
-                    if (response.success) {
-                        self.showNotice(response.data.message, 'success');
-                        self.updateProgress(response.data.progress);
-                    } else {
-                        self.showNotice(response.data.message, 'error');
-                    }
-                }).catch(function() {
-                    self.showNotice(numosR2.strings.error, 'error');
-                }).finally(function() {
-                    $button.removeClass('loading').prop('disabled', false);
-                });
-            });
         },
 
         // ==================== ORPHAN SCANNING ==================== //

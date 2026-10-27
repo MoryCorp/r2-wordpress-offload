@@ -3,9 +3,6 @@ namespace NumosR2;
 
 defined('ABSPATH') || exit;
 
-/**
- * Admin - Dashboard and settings UI with tabbed interface
- */
 class Admin {
 
     private R2Client $r2_client;
@@ -17,15 +14,12 @@ class Admin {
         $this->migrator = $migrator;
         $this->local_cleaner = $local_cleaner;
 
-        // Admin hooks
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_assets']);
 
-        // Media Library hooks
         add_filter('manage_media_columns', [$this, 'add_media_column']);
         add_action('manage_media_custom_column', [$this, 'render_media_column'], 10, 2);
 
-        // AJAX handlers — existing
         add_action('wp_ajax_numos_r2_test_connection', [$this, 'ajax_test_connection']);
         add_action('wp_ajax_numos_r2_migrate_batch', [$this, 'ajax_migrate_batch']);
         add_action('wp_ajax_numos_r2_get_progress', [$this, 'ajax_get_progress']);
@@ -38,36 +32,24 @@ class Admin {
         add_action('wp_ajax_numos_r2_scan_db_orphans', [$this, 'ajax_scan_db_orphans']);
         add_action('wp_ajax_numos_r2_delete_db_orphans', [$this, 'ajax_delete_db_orphans']);
 
-        // AJAX handlers — new
-        add_action('wp_ajax_numos_r2_delete_local_batch', [$this, 'ajax_delete_local_batch']);
         add_action('wp_ajax_numos_r2_delete_all_local', [$this, 'ajax_delete_all_local']);
-        add_action('wp_ajax_numos_r2_verify_batch', [$this, 'ajax_verify_batch']);
         add_action('wp_ajax_numos_r2_verify_all', [$this, 'ajax_verify_all']);
         add_action('wp_ajax_numos_r2_restore_batch', [$this, 'ajax_restore_batch']);
-        add_action('wp_ajax_numos_r2_restore_all', [$this, 'ajax_restore_all']);
-        add_action('wp_ajax_numos_r2_get_savings', [$this, 'ajax_get_savings']);
         add_action('wp_ajax_numos_r2_delete_from_r2_batch', [$this, 'ajax_delete_from_r2_batch']);
         add_action('wp_ajax_numos_r2_sync_from_r2', [$this, 'ajax_sync_from_r2']);
     }
 
-    /**
-     * Add admin menu
-     */
     public function add_admin_menu(): void {
         add_media_page(
-            __('R2 Media Offload', 'numos-r2'),
-            __('R2 Offload', 'numos-r2'),
+            __('Object Storage Offload', 'numos-r2'),
+            __('Object Storage', 'numos-r2'),
             'manage_options',
             'numos-r2-offload',
             [$this, 'render_admin_page']
         );
     }
 
-    /**
-     * Enqueue admin assets
-     */
     public function enqueue_assets(string $hook): void {
-        // Media Library page — grid view badge JS
         if ($hook === 'upload.php') {
             wp_enqueue_script(
                 'numos-r2-media-library',
@@ -83,7 +65,6 @@ class Admin {
                 NUMOS_R2_VERSION
             );
 
-            // Pass R2 status data for grid badges (capped at 500 for performance)
             global $wpdb;
             $r2_statuses = $wpdb->get_results($wpdb->prepare(
                 "SELECT post_id,
@@ -140,15 +121,15 @@ class Admin {
                 'migrating' => __('Migrating...', 'numos-r2'),
                 'complete' => __('Migration complete!', 'numos-r2'),
                 'error' => __('An error occurred', 'numos-r2'),
-                'confirmMigration' => __('Start migration? This will upload all media to R2.', 'numos-r2'),
-                'confirmPurge' => __('Are you sure? This will remove all R2 metadata from the database. Files on R2 will NOT be deleted. You will need to re-migrate if you want to use R2 again.', 'numos-r2'),
+                'confirmMigration' => __('Start migration? This will upload all media to object storage.', 'numos-r2'),
+                'confirmPurge' => __('Are you sure? This will remove all storage metadata from the database. Files in object storage will NOT be deleted. You will need to re-migrate if you want to use object storage again.', 'numos-r2'),
                 'purging' => __('Purging...', 'numos-r2'),
                 'purgeComplete' => __('Purge complete!', 'numos-r2'),
                 'testing' => __('Testing connection...', 'numos-r2'),
                 'connectionOk' => __('Connection successful!', 'numos-r2'),
                 'connectionFailed' => __('Connection failed', 'numos-r2'),
-                'scanning' => __('Scanning R2 bucket...', 'numos-r2'),
-                'confirmDeleteOrphans' => __('Delete these orphan files from R2? This cannot be undone.', 'numos-r2'),
+                'scanning' => __('Scanning storage bucket...', 'numos-r2'),
+                'confirmDeleteOrphans' => __('Delete these orphan files from object storage? This cannot be undone.', 'numos-r2'),
                 'deleting' => __('Deleting...', 'numos-r2'),
                 'noOrphans' => __('No orphan files found.', 'numos-r2'),
                 'scanningDb' => __('Scanning database...', 'numos-r2'),
@@ -159,23 +140,19 @@ class Admin {
                 'selectAll' => __('Select all', 'numos-r2'),
                 'title' => __('Title', 'numos-r2'),
                 'type' => __('Type', 'numos-r2'),
-                // New strings
-                'confirmDeleteLocal' => __('Delete local files for verified synced attachments? Each file will be checked on R2 before deletion.', 'numos-r2'),
+                'confirmDeleteLocal' => __('Delete local files for verified synced attachments? Each file will be checked in object storage before deletion.', 'numos-r2'),
                 'deletingLocal' => __('Deleting local files...', 'numos-r2'),
-                'confirmRestore' => __('Restore files from R2 to local filesystem?', 'numos-r2'),
-                'restoring' => __('Restoring from R2...', 'numos-r2'),
-                'verifying' => __('Verifying R2 files...', 'numos-r2'),
-                'confirmDeleteFromR2' => __('WARNING: This will permanently delete ALL files for this site from R2. Files cannot be recovered. Are you sure?', 'numos-r2'),
-                'deletingFromR2' => __('Deleting from R2...', 'numos-r2'),
-                'confirmSyncFromR2' => __('Scan R2 and reconcile database? This will mark attachments as synced if their files are found on R2.', 'numos-r2'),
-                'syncingFromR2' => __('Scanning R2...', 'numos-r2'),
+                'confirmRestore' => __('Restore files from object storage to local filesystem?', 'numos-r2'),
+                'restoring' => __('Restoring from object storage...', 'numos-r2'),
+                'verifying' => __('Verifying object storage files...', 'numos-r2'),
+                'confirmDeleteFromR2' => __('WARNING: This will permanently delete ALL files for this site from object storage. Files cannot be recovered. Are you sure?', 'numos-r2'),
+                'deletingFromR2' => __('Deleting from object storage...', 'numos-r2'),
+                'confirmSyncFromR2' => __('Scan object storage and reconcile database? This will mark attachments as synced if their files are found in object storage.', 'numos-r2'),
+                'syncingFromR2' => __('Scanning object storage...', 'numos-r2'),
             ],
         ]);
     }
 
-    /**
-     * Render admin page with tabs
-     */
     public function render_admin_page(): void {
         if (!current_user_can('manage_options')) {
             wp_die(__('You do not have permission to access this page.', 'numos-r2'));
@@ -197,12 +174,12 @@ class Admin {
         $synced_with_local = $this->local_cleaner->count_synced_with_local();
         ?>
         <div class="wrap numos-r2-admin">
-            <h1><?php esc_html_e('Numos R2 Media Offload', 'numos-r2'); ?></h1>
+            <h1><?php esc_html_e('Object Storage Offload', 'numos-r2'); ?></h1>
 
             <!-- Status Band -->
             <div class="numos-r2-status-band" role="status">
                 <div class="numos-r2-status-band-item">
-                    <span><?php esc_html_e('R2:', 'numos-r2'); ?></span>
+                    <span><?php esc_html_e('Storage:', 'numos-r2'); ?></span>
                     <strong class="<?php echo $is_r2_available ? 'status-ok' : 'status-error'; ?>">
                         <?php echo $is_r2_available ? esc_html__('Connected', 'numos-r2') : esc_html__('Disconnected', 'numos-r2'); ?>
                     </strong>
@@ -215,7 +192,7 @@ class Admin {
                 <?php endif; ?>
                 <?php if (!empty($stats['synced_size_human'])): ?>
                 <div class="numos-r2-status-band-item">
-                    <span><?php esc_html_e('Total on R2:', 'numos-r2'); ?></span>
+                    <span><?php esc_html_e('Total in storage:', 'numos-r2'); ?></span>
                     <strong id="numos-r2-synced-size"><?php echo esc_html($stats['synced_size_human']); ?></strong>
                 </div>
                 <?php endif; ?>
@@ -249,7 +226,7 @@ class Admin {
                     <!-- Status Cards -->
                     <div class="numos-r2-cards">
                         <div class="numos-r2-card">
-                            <h3><?php esc_html_e('R2 Status', 'numos-r2'); ?></h3>
+                            <h3><?php esc_html_e('Storage Status', 'numos-r2'); ?></h3>
                             <div class="numos-r2-status <?php echo $is_r2_available ? 'status-ok' : 'status-error'; ?>" role="status">
                                 <?php echo $is_r2_available ? '&#10003; ' . esc_html__('Connected', 'numos-r2') : '&#10007; ' . esc_html__('Disconnected', 'numos-r2'); ?>
                             </div>
@@ -259,7 +236,7 @@ class Admin {
                         </div>
 
                         <div class="numos-r2-card">
-                            <h3><?php esc_html_e('Media on R2', 'numos-r2'); ?></h3>
+                            <h3><?php esc_html_e('Media in storage', 'numos-r2'); ?></h3>
                             <div class="numos-r2-stat">
                                 <span class="numos-r2-stat-number" id="numos-r2-synced-count"><?php echo esc_html($progress['synced']); ?></span>
                                 <span class="numos-r2-stat-label"><?php printf(esc_html__('of %d total', 'numos-r2'), $progress['total']); ?></span>
@@ -292,7 +269,7 @@ class Admin {
                             </div>
                             <div class="numos-r2-savings-card">
                                 <span class="numos-r2-savings-number" id="numos-r2-savings-r2only"><?php echo esc_html($savings['r2_only_count']); ?></span>
-                                <span class="numos-r2-savings-label"><?php esc_html_e('R2-Only Files', 'numos-r2'); ?></span>
+                                <span class="numos-r2-savings-label"><?php esc_html_e('Storage-Only Files', 'numos-r2'); ?></span>
                             </div>
                             <div class="numos-r2-savings-card">
                                 <span class="numos-r2-savings-number"><?php echo esc_html($savings['synced_count']); ?></span>
@@ -335,7 +312,7 @@ class Admin {
                 <div class="numos-r2-tab-panel" id="numos-r2-panel-migration">
                     <!-- Migration Controls -->
                     <div class="numos-r2-section">
-                        <h2><?php esc_html_e('Upload to R2', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Upload to storage', 'numos-r2'); ?></h2>
 
                         <div class="numos-r2-migration-controls">
                             <button type="button" class="button button-primary" id="numos-r2-start-migration" <?php echo $progress['pending'] === 0 ? 'disabled' : ''; ?>>
@@ -363,7 +340,7 @@ class Admin {
                     <div class="numos-r2-section">
                         <h2><?php esc_html_e('Delete Local Files', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Remove local copies of files already verified on R2. Each file is checked before deletion. This frees disk space on your server.', 'numos-r2'); ?>
+                            <?php esc_html_e('Remove local copies of files already verified in object storage. Each file is checked before deletion. This frees disk space on your server.', 'numos-r2'); ?>
                         </p>
                         <p>
                             <strong><?php esc_html_e('Eligible:', 'numos-r2'); ?></strong>
@@ -394,9 +371,9 @@ class Admin {
                 <div class="numos-r2-tab-panel" id="numos-r2-panel-tools">
                     <!-- Verify R2 Files -->
                     <div class="numos-r2-section">
-                        <h2><?php esc_html_e('Verify R2 Files', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Verify Storage Files', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Check that all synced files exist on R2 with correct sizes. Useful after bucket changes or to audit integrity.', 'numos-r2'); ?>
+                            <?php esc_html_e('Check that all synced files exist in object storage with correct sizes. Useful after bucket changes or to audit integrity.', 'numos-r2'); ?>
                         </p>
                         <button type="button" class="button" id="numos-r2-verify-files">
                             <?php esc_html_e('Verify Synced Files', 'numos-r2'); ?>
@@ -408,16 +385,16 @@ class Admin {
 
                     <!-- Restore from R2 -->
                     <div class="numos-r2-section">
-                        <h2><?php esc_html_e('Restore from R2', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Restore from storage', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Download files from R2 back to local filesystem. Use this to restore files after local deletion, or before migrating away from R2.', 'numos-r2'); ?>
+                            <?php esc_html_e('Download files from object storage back to local filesystem. Use this to restore files after local deletion, or before migrating away from object storage.', 'numos-r2'); ?>
                         </p>
                         <p>
-                            <strong><?php esc_html_e('R2-only attachments:', 'numos-r2'); ?></strong>
+                            <strong><?php esc_html_e('Storage-only attachments:', 'numos-r2'); ?></strong>
                             <span id="numos-r2-r2only-count"><?php echo esc_html($savings['r2_only_count']); ?></span>
                         </p>
                         <button type="button" class="button" id="numos-r2-restore-r2" <?php echo $savings['r2_only_count'] === 0 ? 'disabled' : ''; ?>>
-                            <?php esc_html_e('Restore from R2', 'numos-r2'); ?>
+                            <?php esc_html_e('Restore from storage', 'numos-r2'); ?>
                         </button>
                         <div id="numos-r2-restore-progress" style="display: none; margin-top: 15px;">
                             <div class="numos-r2-progress-bar large" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
@@ -452,9 +429,9 @@ class Admin {
 
                     <!-- R2 Bucket Cleanup -->
                     <div class="numos-r2-section">
-                        <h2><?php esc_html_e('R2 Bucket Cleanup', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Storage Bucket Cleanup', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Scan your R2 bucket for files not in your current site prefix.', 'numos-r2'); ?>
+                            <?php esc_html_e('Scan this site\'s storage objects for files no longer referenced by any media.', 'numos-r2'); ?>
                         </p>
                         <p>
                             <strong><?php esc_html_e('Current prefix:', 'numos-r2'); ?></strong>
@@ -476,12 +453,12 @@ class Admin {
 
                     <!-- Sync from R2 -->
                     <div class="numos-r2-section">
-                        <h2><?php esc_html_e('Sync from R2', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Sync from storage', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Reconcile database with R2. Scans R2 and marks attachments as synced if their files are found. Useful after a database restore.', 'numos-r2'); ?>
+                            <?php esc_html_e('Reconcile database with object storage. Scans object storage and marks attachments as synced if their files are found. Useful after a database restore.', 'numos-r2'); ?>
                         </p>
                         <button type="button" class="button" id="numos-r2-sync-from-r2">
-                            <?php esc_html_e('Sync from R2', 'numos-r2'); ?>
+                            <?php esc_html_e('Sync from storage', 'numos-r2'); ?>
                         </button>
                         <div id="numos-r2-sync-from-r2-results" style="display: none; margin-top: 15px;">
                             <div id="numos-r2-sync-from-r2-summary"></div>
@@ -490,10 +467,10 @@ class Admin {
 
                     <!-- Delete from R2 -->
                     <div class="numos-r2-section numos-r2-danger-zone">
-                        <h2><?php esc_html_e('Delete Site Files from R2', 'numos-r2'); ?></h2>
+                        <h2><?php esc_html_e('Delete Site Files from storage', 'numos-r2'); ?></h2>
                         <p class="description">
                             <?php printf(
-                                esc_html__('Delete all files for this site from the R2 bucket. This removes all objects under the prefix %s. Local files are NOT affected. R2 metadata will be reset.', 'numos-r2'),
+                                esc_html__('Delete all files for this site from the storage bucket. This removes all objects under the prefix %s. Local files are NOT affected. Storage metadata will be reset.', 'numos-r2'),
                                 '<code>' . esc_html(numos_r2_get_site_prefix()) . '/</code>'
                             ); ?>
                         </p>
@@ -502,7 +479,7 @@ class Admin {
                             <span id="numos-r2-r2-file-count"><?php echo esc_html($progress['synced']); ?></span>
                         </p>
                         <button type="button" class="button button-danger" id="numos-r2-delete-from-r2" <?php echo $progress['synced'] === 0 ? 'disabled' : ''; ?>>
-                            <?php esc_html_e('Delete All from R2', 'numos-r2'); ?>
+                            <?php esc_html_e('Delete All from storage', 'numos-r2'); ?>
                         </button>
                         <div id="numos-r2-delete-r2-progress" style="display: none; margin-top: 15px;">
                             <div class="numos-r2-progress-bar large" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
@@ -519,10 +496,10 @@ class Admin {
                     <div class="numos-r2-section numos-r2-danger-zone">
                         <h2><?php esc_html_e('Danger Zone', 'numos-r2'); ?></h2>
                         <p class="description">
-                            <?php esc_html_e('Purge all R2 metadata from the database. This will NOT delete files from R2 or your local server.', 'numos-r2'); ?>
+                            <?php esc_html_e('Purge all storage metadata from the database. This will NOT delete files from object storage or your local server.', 'numos-r2'); ?>
                         </p>
                         <button type="button" class="button button-danger" id="numos-r2-purge-meta">
-                            <?php esc_html_e('Purge R2 Metadata', 'numos-r2'); ?>
+                            <?php esc_html_e('Purge Storage Metadata', 'numos-r2'); ?>
                         </button>
                     </div>
                 </div>
@@ -535,13 +512,13 @@ class Admin {
                         <form id="numos-r2-settings-form">
                             <table class="form-table">
                                 <tr>
-                                    <th scope="row"><?php esc_html_e('Enable R2 Offload', 'numos-r2'); ?></th>
+                                    <th scope="row"><?php esc_html_e('Enable Offload', 'numos-r2'); ?></th>
                                     <td>
                                         <label>
                                             <input type="checkbox" name="enabled" value="1" <?php checked(!empty($settings['enabled'])); ?>>
-                                            <?php esc_html_e('Enable URL rewriting to R2', 'numos-r2'); ?>
+                                            <?php esc_html_e('Enable URL rewriting to object storage', 'numos-r2'); ?>
                                         </label>
-                                        <p class="description"><?php esc_html_e('When enabled, synced media URLs will point to R2.', 'numos-r2'); ?></p>
+                                        <p class="description"><?php esc_html_e('When enabled, synced media URLs will point to object storage.', 'numos-r2'); ?></p>
                                     </td>
                                 </tr>
                                 <tr>
@@ -549,9 +526,9 @@ class Admin {
                                     <td>
                                         <label>
                                             <input type="checkbox" name="sync_new_uploads" value="1" <?php checked(!empty($settings['sync_new_uploads'])); ?>>
-                                            <?php esc_html_e('Automatically upload new media to R2', 'numos-r2'); ?>
+                                            <?php esc_html_e('Automatically upload new media to object storage', 'numos-r2'); ?>
                                         </label>
-                                        <p class="description"><?php esc_html_e('New uploads will be automatically synced to R2.', 'numos-r2'); ?></p>
+                                        <p class="description"><?php esc_html_e('New uploads will be automatically synced to object storage.', 'numos-r2'); ?></p>
                                     </td>
                                 </tr>
                                 <tr>
@@ -559,9 +536,9 @@ class Admin {
                                     <td>
                                         <label>
                                             <input type="checkbox" name="remove_local_files" value="1" <?php checked(!empty($settings['remove_local_files'])); ?>>
-                                            <?php esc_html_e('Automatically delete local files after successful R2 upload', 'numos-r2'); ?>
+                                            <?php esc_html_e('Automatically delete local files after successful upload to object storage', 'numos-r2'); ?>
                                         </label>
-                                        <p class="description"><?php esc_html_e('Each file is verified on R2 before local deletion. Applies to new uploads and migrations. Use with caution.', 'numos-r2'); ?></p>
+                                        <p class="description"><?php esc_html_e('Each file is verified in object storage before local deletion. Applies to new uploads and migrations. Use with caution.', 'numos-r2'); ?></p>
                                     </td>
                                 </tr>
                                 <tr>
@@ -654,17 +631,11 @@ class Admin {
         <?php
     }
 
-    /**
-     * Add R2 Status column to Media Library list view
-     */
     public function add_media_column(array $columns): array {
-        $columns['numos_r2_status'] = __('R2 Status', 'numos-r2');
+        $columns['numos_r2_status'] = __('Storage Status', 'numos-r2');
         return $columns;
     }
 
-    /**
-     * Render R2 Status column content
-     */
     public function render_media_column(string $column_name, int $post_id): void {
         if ($column_name !== 'numos_r2_status') {
             return;
@@ -674,7 +645,7 @@ class Admin {
         $local_deleted = get_post_meta($post_id, '_numos_r2_local_deleted', true);
 
         if ($status === 'synced' && $local_deleted) {
-            echo '<span class="numos-r2-badge numos-r2-badge-r2only">' . esc_html__('R2 Only', 'numos-r2') . '</span>';
+            echo '<span class="numos-r2-badge numos-r2-badge-r2only">' . esc_html__('Storage Only', 'numos-r2') . '</span>';
         } elseif ($status === 'synced') {
             echo '<span class="numos-r2-badge numos-r2-badge-synced">' . esc_html__('Synced', 'numos-r2') . '</span>';
         } elseif ($status === 'partial') {
@@ -687,19 +658,13 @@ class Admin {
         }
     }
 
-    // ==================== AJAX HANDLERS — EXISTING ==================== //
-
     public function ajax_test_connection(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         delete_transient('numos_r2_health_status');
         $is_available = $this->r2_client->head_bucket();
 
         if ($is_available) {
-            // Auto-configure CORS if not already done
             $cors_configured = get_option('numos_r2_cors_configured');
             $cors_msg = '';
             if (!$cors_configured) {
@@ -718,10 +683,7 @@ class Admin {
     }
 
     public function ajax_migrate_batch(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $is_start = isset($_POST['start']) && $_POST['start'] === 'true';
         if ($is_start) {
@@ -736,10 +698,7 @@ class Admin {
     }
 
     public function ajax_get_progress(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $progress = $this->migrator->get_progress();
         $stats = $this->migrator->get_stats();
@@ -754,10 +713,7 @@ class Admin {
     }
 
     public function ajax_save_settings(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $batch_size = isset($_POST['batch_size']) ? absint($_POST['batch_size']) : 50;
         $batch_size = max(10, min(200, $batch_size));
@@ -782,18 +738,12 @@ class Admin {
     }
 
     public function ajax_get_logs(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
         wp_send_json_success(['logs' => $this->get_recent_logs(100)]);
     }
 
     public function ajax_reset_failed(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $count = $this->migrator->reset_failed();
         $progress = $this->migrator->get_progress();
@@ -804,23 +754,10 @@ class Admin {
     }
 
     public function ajax_purge_meta(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
+        $this->refuse_if_r2_only();
 
-        global $wpdb;
-        $deleted = $wpdb->query($wpdb->prepare(
-            "DELETE FROM {$wpdb->postmeta} WHERE meta_key LIKE %s",
-            $wpdb->esc_like('_numos_r2_') . '%'
-        ));
-
-        delete_option('numos_r2_migration_checkpoint');
-        delete_option('numos_r2_migration_stats');
-        delete_transient('numos_r2_health_status');
-        delete_transient('numos_r2_stats_cache');
-        delete_transient('numos_r2_synced_paths');
-        $this->migrator->invalidate_progress_cache();
+        $deleted = $this->migrator->purge_metadata();
 
         wp_send_json_success([
             'message' => sprintf(__('Purged %d metadata entries', 'numos-r2'), $deleted),
@@ -828,24 +765,50 @@ class Admin {
         ]);
     }
 
-    public function ajax_list_orphans(): void {
+    /**
+     * Stop the request unless it carries a valid nonce from an administrator.
+     */
+    private function authorize(): void {
         check_ajax_referer('numos_r2_nonce', 'nonce');
         if (!current_user_can('manage_options')) {
             wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
         }
+    }
+
+    /**
+     * Stop the request while some attachment has files that only exist in object storage:
+     * forgetting or deleting them would lose those files for good.
+     */
+    private function refuse_if_r2_only(): void {
+        $r2_only = $this->local_cleaner->get_savings()['r2_only_count'];
+        if ($r2_only > 0) {
+            wp_send_json_error([
+                'message' => sprintf(
+                    __('%d attachments have no local copy; object storage is their only source. Restore them first.', 'numos-r2'),
+                    $r2_only
+                ),
+            ]);
+        }
+    }
+
+    public function ajax_list_orphans(): void {
+        $this->authorize();
 
         $site_prefix = numos_r2_get_site_prefix();
         $continuation_token = sanitize_text_field($_POST['token'] ?? '');
-        $result = $this->r2_client->list_objects('', $continuation_token, 500);
+        // Scope strictly to this tenant's prefix: never list, expose, or offer another site's
+        // objects on a shared bucket.
+        $result = $this->r2_client->list_objects($site_prefix . '/', $continuation_token, 500);
 
         if ($result === false) {
-            wp_send_json_error(['message' => __('Failed to list R2 objects', 'numos-r2')]);
+            wp_send_json_error(['message' => __('Failed to list storage objects', 'numos-r2')]);
         }
 
+        $referenced = $this->local_cleaner->all_referenced_keys();
         $orphans = [];
         $total_size = 0;
         foreach ($result['objects'] as $obj) {
-            if (strpos($obj['key'], $site_prefix . '/') !== 0) {
+            if (!isset($referenced[$obj['key']])) {
                 $orphans[] = [
                     'key' => $obj['key'],
                     'size' => $obj['size'],
@@ -867,10 +830,7 @@ class Admin {
     }
 
     public function ajax_delete_orphans(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $keys = isset($_POST['keys']) ? array_map('sanitize_text_field', (array)$_POST['keys']) : [];
         if (empty($keys)) {
@@ -878,9 +838,11 @@ class Admin {
         }
 
         $site_prefix = numos_r2_get_site_prefix();
+        $referenced = $this->local_cleaner->all_referenced_keys();
         $safe_keys = [];
         foreach ($keys as $key) {
-            if (strpos($key, $site_prefix . '/') !== 0) {
+            // Only delete objects of this tenant that no attachment references.
+            if (strpos($key, $site_prefix . '/') === 0 && !isset($referenced[$key])) {
                 $safe_keys[] = $key;
             }
         }
@@ -891,27 +853,21 @@ class Admin {
 
         $result = $this->r2_client->delete_objects($safe_keys);
         wp_send_json_success([
-            'message' => sprintf(__('Deleted %d files from R2', 'numos-r2'), $result['deleted']),
+            'message' => sprintf(__('Deleted %d files from object storage', 'numos-r2'), $result['deleted']),
             'deleted' => $result['deleted'],
             'errors' => $result['errors'],
         ]);
     }
 
     public function ajax_scan_db_orphans(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $orphans = $this->migrator->get_db_orphans(500);
         wp_send_json_success(['orphans' => $orphans, 'count' => count($orphans)]);
     }
 
     public function ajax_delete_db_orphans(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $ids = isset($_POST['ids']) ? array_map('intval', (array)$_POST['ids']) : [];
         if (empty($ids)) {
@@ -928,107 +884,25 @@ class Admin {
         ]);
     }
 
-    // ==================== AJAX HANDLERS — NEW ==================== //
-
-    public function ajax_delete_local_batch(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
-
-        $batch_size = isset($_POST['batch_size']) ? absint($_POST['batch_size']) : 50;
-        $batch_size = max(1, min(200, $batch_size));
-
-        $result = $this->local_cleaner->batch_delete_local($batch_size);
-        $savings = $this->local_cleaner->get_savings();
-        $remaining = $this->local_cleaner->count_synced_with_local();
-
-        wp_send_json_success([
-            'result' => $result,
-            'savings' => $savings,
-            'remaining' => $remaining,
-        ]);
-    }
-
     public function ajax_delete_all_local(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
-
-        $result = $this->local_cleaner->delete_all_local();
-        $savings = $this->local_cleaner->get_savings();
-        $remaining = $this->local_cleaner->count_synced_with_local();
+        $this->authorize();
 
         wp_send_json_success([
-            'result' => $result,
-            'savings' => $savings,
-            'remaining' => $remaining,
-        ]);
-    }
-
-    public function ajax_verify_batch(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
-
-        $batch_size = isset($_POST['batch_size']) ? absint($_POST['batch_size']) : 20;
-        $offset = isset($_POST['offset']) ? absint($_POST['offset']) : 0;
-
-        global $wpdb;
-        $ids = array_map('intval', $wpdb->get_col($wpdb->prepare(
-            "SELECT DISTINCT post_id FROM {$wpdb->postmeta}
-            WHERE meta_key = '_numos_r2_status' AND meta_value = %s
-            ORDER BY post_id ASC LIMIT %d OFFSET %d",
-            'synced', $batch_size, $offset
-        )));
-
-        if (empty($ids)) {
-            wp_send_json_success(['done' => true, 'ok' => 0, 'issues' => 0, 'details' => []]);
-        }
-
-        $ok = 0;
-        $issues = 0;
-        $details = [];
-
-        foreach ($ids as $id) {
-            $v = $this->local_cleaner->verify_attachment($id);
-            if ($v['verified']) {
-                $ok++;
-            } else {
-                $issues++;
-                $details[] = [
-                    'id' => $id,
-                    'errors' => $v['errors'],
-                ];
-            }
-        }
-
-        wp_send_json_success([
-            'done' => count($ids) < $batch_size,
-            'ok' => $ok,
-            'issues' => $issues,
-            'details' => $details,
-            'next_offset' => $offset + count($ids),
+            'result' => $this->local_cleaner->delete_all_local(),
+            'savings' => $this->local_cleaner->get_savings(),
+            'remaining' => $this->local_cleaner->count_synced_with_local(),
         ]);
     }
 
     public function ajax_verify_all(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $result = $this->local_cleaner->verify_all();
         wp_send_json_success($result);
     }
 
     public function ajax_restore_batch(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         $batch_size = isset($_POST['batch_size']) ? absint($_POST['batch_size']) : 20;
 
@@ -1041,55 +915,18 @@ class Admin {
         ]);
     }
 
-    public function ajax_restore_all(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
-
-        $result = $this->local_cleaner->restore_all();
-        $savings = $this->local_cleaner->get_savings();
-
-        wp_send_json_success([
-            'result' => $result,
-            'savings' => $savings,
-        ]);
-    }
-
-    public function ajax_get_savings(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
-
-        wp_send_json_success($this->local_cleaner->get_savings());
-    }
-
     public function ajax_delete_from_r2_batch(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
-        // Block if any attachments have local files deleted (R2 is the only copy)
-        $savings = $this->local_cleaner->get_savings();
-        if ($savings['r2_only_count'] > 0) {
-            wp_send_json_error([
-                'message' => sprintf(
-                    __('%d attachments have no local copy — R2 is their only source. Restore them first before deleting from R2.', 'numos-r2'),
-                    $savings['r2_only_count']
-                ),
-            ]);
-        }
+        $this->refuse_if_r2_only();
 
         $continuation_token = sanitize_text_field($_POST['token'] ?? '');
         $site_prefix = numos_r2_get_site_prefix();
 
-        // List objects under this site's prefix
         $result = $this->r2_client->list_objects($site_prefix . '/', $continuation_token, 500);
 
         if ($result === false) {
-            wp_send_json_error(['message' => __('Failed to list R2 objects', 'numos-r2')]);
+            wp_send_json_error(['message' => __('Failed to list storage objects', 'numos-r2')]);
         }
 
         $keys = array_column($result['objects'], 'key');
@@ -1104,19 +941,8 @@ class Admin {
 
         $has_more = $result['is_truncated'];
 
-        // If no more files, clean up metadata
         if (!$has_more) {
-            global $wpdb;
-            $wpdb->query($wpdb->prepare(
-                "DELETE FROM {$wpdb->postmeta} WHERE meta_key LIKE %s",
-                $wpdb->esc_like('_numos_r2_') . '%'
-            ));
-            delete_option('numos_r2_migration_checkpoint');
-            delete_option('numos_r2_migration_stats');
-            delete_transient('numos_r2_health_status');
-            delete_transient('numos_r2_stats_cache');
-            delete_transient('numos_r2_synced_paths');
-            $this->migrator->invalidate_progress_cache();
+            $this->migrator->purge_metadata();
         }
 
         wp_send_json_success([
@@ -1129,10 +955,7 @@ class Admin {
     }
 
     public function ajax_sync_from_r2(): void {
-        check_ajax_referer('numos_r2_nonce', 'nonce');
-        if (!current_user_can('manage_options')) {
-            wp_send_json_error(['message' => __('Permission denied', 'numos-r2')]);
-        }
+        $this->authorize();
 
         @set_time_limit(300);
 
@@ -1150,10 +973,8 @@ class Admin {
         ]);
     }
 
-    // ==================== HELPERS ==================== //
-
     private function get_recent_logs(int $lines = 50): string {
-        $log_file = WP_CONTENT_DIR . '/numos-r2-logs/numos-r2-' . gmdate('Y-m-d') . '.log.php';
+        $log_file = Logger::file();
         if (!file_exists($log_file)) {
             return __('No logs available', 'numos-r2');
         }
@@ -1163,7 +984,6 @@ class Admin {
             return __('No logs available', 'numos-r2');
         }
 
-        // Skip the PHP guard line (first line)
         if (!empty($file_content[0]) && strpos($file_content[0], '<' . '?php exit;') === 0) {
             array_shift($file_content);
         }

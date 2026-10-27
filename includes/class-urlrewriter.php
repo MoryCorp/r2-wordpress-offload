@@ -4,51 +4,42 @@ namespace NumosR2;
 defined('ABSPATH') || exit;
 
 /**
- * URL Rewriter - Rewrites media URLs to R2
+ * Serves offloaded media from R2. Every URL resolves through the manifest: the public URL is
+ * the recorded key under the public base, never a path rebuilt from the local URL.
+ *
+ * Rewriting does not depend on the S3 API health check: the public CDN serves a file on R2
+ * independently of the private API, and a local URL would 404 once the local copy is removed.
  */
 class UrlRewriter {
 
-    private R2Client $r2_client;
     private array $settings;
     private string $local_base_url;
     private string $r2_base_url;
-    private string $prefix;
 
-    /** @var array|null Static cache of synced relative paths (main + thumbnails) */
-    private static ?array $synced_paths_cache = null;
+    const MAP_TRANSIENT = 'numos_r2_key_map';
 
-    public function __construct(R2Client $r2_client) {
-        $this->r2_client = $r2_client;
+    /** @var array<string,string>|null relative path => R2 key */
+    private static ?array $map_cache = null;
+
+    public function __construct() {
         $this->settings = get_option('numos_r2_settings', []);
         $this->r2_base_url = rtrim(NUMOS_R2_PUBLIC_URL, '/');
-        $this->prefix = numos_r2_get_site_prefix();
-
-        $upload_dir = wp_upload_dir();
-        $this->local_base_url = $upload_dir['baseurl'];
+        $this->local_base_url = wp_upload_dir()['baseurl'];
     }
 
-    /**
-     * Register WordPress hooks
-     */
     public function register_hooks(): void {
-        // Only if enabled
         if (empty($this->settings['enabled'])) {
             return;
         }
 
-        // Attachment URL hooks
         add_filter('wp_get_attachment_url', [$this, 'rewrite_attachment_url'], 99, 2);
         add_filter('wp_get_attachment_image_src', [$this, 'rewrite_image_src'], 99, 4);
-
-        // Responsive images (srcset)
         add_filter('wp_calculate_image_srcset', [$this, 'rewrite_srcset'], 99, 5);
 
-        // Content URLs (for hardcoded URLs in post content)
         add_filter('the_content', [$this, 'rewrite_content_urls'], 99);
         add_filter('widget_text', [$this, 'rewrite_content_urls'], 99);
         add_filter('widget_text_content', [$this, 'rewrite_content_urls'], 99);
 
-        // ACF support
         if (function_exists('acf')) {
             add_filter('acf/format_value/type=image', [$this, 'rewrite_acf_image'], 99, 3);
             add_filter('acf/format_value/type=gallery', [$this, 'rewrite_acf_gallery'], 99, 3);
@@ -56,132 +47,277 @@ class UrlRewriter {
             add_filter('acf/format_value/type=file', [$this, 'rewrite_acf_file'], 99, 3);
         }
 
-        // Final output buffer — catches everything (Elementor templates, noscript, inline CSS, etc.)
+        // Output buffer catches URLs the typed filters miss (Elementor templates, inline CSS,
+        // JSON in page builders). Never on admin screens, where editors need the local paths.
         if (!is_admin()) {
             add_action('template_redirect', [$this, 'start_output_buffer'], 1);
         }
-
-        // AJAX output buffer — catches dynamically loaded content (JetEngine listings, load-more, etc.)
         if (wp_doing_ajax()) {
             add_action('admin_init', [$this, 'start_output_buffer'], 1);
         }
-
-        // REST API output buffer — catches content loaded via REST endpoints
         add_action('rest_api_init', [$this, 'start_output_buffer'], 1);
     }
 
     /**
-     * Rewrite attachment URL to R2
+     * R2 URL of a file written under the local uploads base, or null when the file is not on
+     * R2. The path is kept exactly as written, raw or percent-encoded, behind the location of
+     * its key: keys always end with the relative path, and WordPress derives size URLs and
+     * srcset matches from the raw file names of the URL it gets back.
      *
-     * @param string $url Original URL
-     * @param int $attachment_id Attachment ID
-     * @return string Rewritten URL
+     * @param array<string,string> $keys relative path => R2 key
      */
-    public function rewrite_attachment_url(string $url, int $attachment_id): string {
-        // Check if synced to R2
-        $r2_url = get_post_meta($attachment_id, '_numos_r2_url', true);
-
-        if (empty($r2_url)) {
-            // Fallback: derive URL from r2_key if status is synced but _numos_r2_url is missing
-            $status = get_post_meta($attachment_id, '_numos_r2_status', true);
-            if ($status === 'synced') {
-                $r2_key = get_post_meta($attachment_id, '_numos_r2_key', true);
-                if (!empty($r2_key)) {
-                    $r2_url = $this->r2_client->get_public_url($r2_key);
-                    update_post_meta($attachment_id, '_numos_r2_url', $r2_url);
-                }
-            }
-        }
-
-        if (empty($r2_url)) {
-            return $url;
-        }
-
-        // Check if R2 is available (with fallback)
-        if (!$this->r2_client->is_available()) {
-            return $url; // Fallback to local
-        }
-
-        return $r2_url;
+    private function to_r2(string $written, array $keys): ?string {
+        $relative = isset($keys[$written]) ? $written : rawurldecode($written);
+        return isset($keys[$relative]) ? $this->location($keys[$relative], $relative) . $written : null;
     }
 
     /**
-     * Rewrite image src array
-     *
-     * @param array|false $image Image data or false
-     * @param int $attachment_id Attachment ID
-     * @param string|int[] $size Image size
-     * @param bool $icon Whether icon
-     * @return array|false
+     * Public URL of the folder a key lives in, given the relative path the key ends with.
      */
-    public function rewrite_image_src($image, int $attachment_id, $size, bool $icon) {
-        if (!is_array($image) || empty($image[0])) {
+    private function location(string $key, string $relative): string {
+        return $this->r2_base_url . '/' . substr($key, 0, strlen($key) - strlen($relative));
+    }
+
+    public function rewrite_attachment_url($url, $attachment_id) {
+        $id = numos_r2_attachment_id($attachment_id);
+        if ($id === 0 || !is_string($url)) {
+            return $url;
+        }
+        $written = $this->url_to_relative($url);
+        $manifest = $written === null ? null : Manifest::get($id);
+        if ($manifest === null) {
+            return $url;
+        }
+        return $this->to_r2($written, Manifest::keys($manifest)) ?? $url;
+    }
+
+    /**
+     * Core builds a size URL by swapping the file name in the main file's URL, so a size that
+     * never reached R2 comes out under the main file's R2 folder: it is sent back to its local
+     * copy, and a size that is on R2 under a local main URL is sent to R2.
+     */
+    public function rewrite_image_src($image, $attachment_id, $size, $icon) {
+        $id = numos_r2_attachment_id($attachment_id);
+        $valid = $id > 0 && is_array($image) && !empty($image[0]) && is_string($image[0]);
+        $manifest = $valid ? Manifest::get($id) : null;
+        if ($manifest === null) {
             return $image;
         }
 
-        // Check if R2 is available
-        if (!$this->r2_client->is_available()) {
-            return $image;
+        $keys = Manifest::keys($manifest);
+        $relative = array_key_first($keys);
+        $location = $this->location($keys[$relative], $relative);
+        $written = strpos($image[0], $location) === 0
+            ? substr($image[0], strlen($location))
+            : $this->url_to_relative($image[0]);
+        if ($written !== null) {
+            $image[0] = $this->to_r2($written, $keys) ?? $this->local_base_url . '/' . $written;
         }
-
-        // Rewrite URL in the array
-        $image[0] = $this->maybe_rewrite_url($image[0], $attachment_id);
-
         return $image;
     }
 
-    /**
-     * Rewrite srcset URLs
-     *
-     * @param array $sources Array of image sources
-     * @param array $size_array Size array
-     * @param string $image_src Image source URL
-     * @param array $image_meta Image metadata
-     * @param int $attachment_id Attachment ID
-     * @return array
-     */
-    public function rewrite_srcset(array $sources, array $size_array, string $image_src, array $image_meta, int $attachment_id): array {
-        // Check if R2 is available
-        if (!$this->r2_client->is_available()) {
+    public function rewrite_srcset($sources, $size_array, $image_src, $image_meta, $attachment_id) {
+        $id = numos_r2_attachment_id($attachment_id);
+        $manifest = ($id === 0 || !is_array($sources)) ? null : Manifest::get($id);
+        if ($manifest === null) {
             return $sources;
         }
 
-        // Check if attachment is synced
-        $status = get_post_meta($attachment_id, '_numos_r2_status', true);
-        if ($status !== 'synced') {
-            return $sources;
+        $keys = Manifest::keys($manifest);
+        foreach ($sources as &$source) {
+            $written = $this->url_to_relative($source['url']);
+            if ($written !== null) {
+                $source['url'] = $this->to_r2($written, $keys) ?? $source['url'];
+            }
         }
-
-        foreach ($sources as $width => &$source) {
-            $source['url'] = $this->rewrite_local_to_r2($source['url']);
-        }
+        unset($source);
 
         return $sources;
     }
 
     /**
-     * Build a regex fragment matching the local uploads base URL.
-     * The host is matched case-insensitively (RFC 3986), the path stays case-sensitive.
+     * ACF passes the post ID, "options", "user_1", "term_2"... as second argument: unused here.
+     */
+    public function rewrite_acf_image($value, $post_id, $field) {
+        if (empty($value)) {
+            return $value;
+        }
+
+        if (is_array($value)) {
+            if (isset($value['url'])) {
+                $value['url'] = $this->rewrite_attachment_url($value['url'], $value['id'] ?? 0);
+            }
+            if (!empty($value['sizes']) && is_array($value['sizes'])) {
+                foreach ($value['sizes'] as &$url) {
+                    if (is_string($url)) {
+                        $url = $this->rewrite_mapped_url($url);
+                    }
+                }
+                unset($url);
+            }
+        } elseif (is_string($value)) {
+            $value = $this->rewrite_mapped_url($value);
+        }
+
+        return $value;
+    }
+
+    public function rewrite_acf_gallery($value, $post_id, $field) {
+        if (empty($value) || !is_array($value)) {
+            return $value;
+        }
+        foreach ($value as &$image) {
+            $image = $this->rewrite_acf_image($image, $post_id, $field);
+        }
+        unset($image);
+        return $value;
+    }
+
+    public function rewrite_acf_url($value, $post_id, $field) {
+        if (empty($value) || !is_string($value)) {
+            return $value;
+        }
+        return $this->rewrite_mapped_url($value);
+    }
+
+    public function rewrite_acf_file($value, $post_id, $field) {
+        if (empty($value)) {
+            return $value;
+        }
+        if (is_array($value) && isset($value['url'])) {
+            $value['url'] = $this->rewrite_mapped_url($value['url']);
+        } elseif (is_string($value)) {
+            $value = $this->rewrite_mapped_url($value);
+        }
+        return $value;
+    }
+
+    /**
+     * Rewrite a local upload URL to R2 if its path is in the key map. Used where no
+     * attachment ID is available (content, ACF strings, output buffer).
+     */
+    private function rewrite_mapped_url(string $url): string {
+        $written = $this->url_to_relative($url);
+        if ($written === null) {
+            return $url;
+        }
+        return $this->to_r2($written, $this->get_key_map()) ?? $url;
+    }
+
+    /**
+     * Path after the local uploads base, or null if the URL is not under it. Strict prefix match.
+     */
+    private function url_to_relative(string $url): ?string {
+        if (strpos($url, $this->local_base_url) !== 0) {
+            return null;
+        }
+        return ltrim(substr($url, strlen($this->local_base_url)), '/');
+    }
+
+    public function rewrite_content_urls($content) {
+        if (empty($content) || !is_string($content)) {
+            return $content;
+        }
+        return $this->rewrite_urls_in($content, false);
+    }
+
+    public function start_output_buffer(): void {
+        ob_start([$this, 'rewrite_output_buffer']);
+    }
+
+    public function rewrite_output_buffer(string $output): string {
+        if (empty($output)) {
+            return $output;
+        }
+        // Plain URLs, then JSON-escaped URLs (slashes as \/).
+        $output = $this->rewrite_urls_in($output, false);
+        $output = $this->rewrite_urls_in($output, true);
+        return $output;
+    }
+
+    private function rewrite_urls_in(string $text, bool $json_escaped): string {
+        $map = $this->get_key_map();
+        if (empty($map)) {
+            return $text;
+        }
+
+        $base_pattern = $this->build_base_pattern($json_escaped);
+
+        if ($json_escaped) {
+            $pattern = '#' . $base_pattern . '((?:\\\\/[^\\s"\'<>&\\\\]+)+)#';
+            $replace = function ($matches) use ($map) {
+                $url = $this->to_r2(str_replace('\\/', '/', ltrim($matches[1], '\\/')), $map);
+                return $url === null ? $matches[0] : str_replace('/', '\\/', $url);
+            };
+        } else {
+            $pattern = '#' . $base_pattern . '/([^\s"\'<>\\\\]+)#';
+            $replace = function ($matches) use ($map) {
+                return $this->to_r2($matches[1], $map) ?? $matches[0];
+            };
+        }
+
+        return preg_replace_callback($pattern, $replace, $text);
+    }
+
+    /**
+     * Drop the key map so the next lookup rebuilds it from the manifests.
+     */
+    public static function forget_map(): void {
+        delete_transient(self::MAP_TRANSIENT);
+        self::$map_cache = null;
+    }
+
+    /**
+     * Map of every offloaded file: relative path => R2 key, merged from all attachment
+     * manifests. Cached per request and in a short transient.
      *
-     * @param bool $json_escaped Whether slashes are JSON-escaped (\/) in the target string
-     * @return string Regex fragment (no delimiters, no trailing slash)
+     * @return array<string,string>
+     */
+    private function get_key_map(): array {
+        if (self::$map_cache !== null) {
+            return self::$map_cache;
+        }
+
+        $cached = get_transient(self::MAP_TRANSIENT);
+        if (is_array($cached)) {
+            self::$map_cache = $cached;
+            return self::$map_cache;
+        }
+
+        global $wpdb;
+        $rows = $wpdb->get_col($wpdb->prepare(
+            "SELECT meta_value FROM {$wpdb->postmeta} WHERE meta_key = %s",
+            Manifest::META_KEY
+        ));
+
+        $map = [];
+        foreach ($rows as $raw) {
+            $manifest = maybe_unserialize($raw);
+            if (is_array($manifest) && !empty($manifest['files']) && is_array($manifest['files'])) {
+                $map = Manifest::keys($manifest) + $map;
+            }
+        }
+
+        set_transient(self::MAP_TRANSIENT, $map, 5 * MINUTE_IN_SECONDS);
+        self::$map_cache = $map;
+        return self::$map_cache;
+    }
+
+    /**
+     * Regex fragment matching the local uploads base URL. Host matched case-insensitively
+     * (RFC 3986), path case-sensitive. Optionally with JSON-escaped slashes.
      */
     private function build_base_pattern(bool $json_escaped = false): string {
         $parsed = parse_url($this->local_base_url);
 
         if (!$parsed || empty($parsed['host'])) {
-            $base = $json_escaped
-                ? str_replace('/', '\\/', $this->local_base_url)
-                : $this->local_base_url;
+            $base = $json_escaped ? str_replace('/', '\\/', $this->local_base_url) : $this->local_base_url;
             return preg_quote($base, '#');
         }
 
-        // Split around the host to preserve any scheme/port/path exactly as-is.
         $host_pos = strpos($this->local_base_url, $parsed['host']);
         if ($host_pos === false) {
-            $base = $json_escaped
-                ? str_replace('/', '\\/', $this->local_base_url)
-                : $this->local_base_url;
+            $base = $json_escaped ? str_replace('/', '\\/', $this->local_base_url) : $this->local_base_url;
             return preg_quote($base, '#');
         }
 
@@ -197,350 +333,4 @@ class UrlRewriter {
             . '(?i:' . preg_quote($parsed['host'], '#') . ')'
             . preg_quote($after_host, '#');
     }
-
-    /**
-     * Rewrite URLs in post content (only for synced files)
-     *
-     * @param string $content Post content
-     * @return string
-     */
-    public function rewrite_content_urls(string $content): string {
-        if (empty($content)) {
-            return $content;
-        }
-
-        // Check if R2 is available
-        if (!$this->r2_client->is_available()) {
-            return $content;
-        }
-
-        // Only rewrite URLs for files that are actually synced
-        $synced_paths = $this->get_synced_paths();
-
-        if (empty($synced_paths)) {
-            return $content;
-        }
-
-        $base_pattern = $this->build_base_pattern();
-        $r2_url_with_prefix = $this->r2_base_url . '/' . $this->prefix;
-
-        return preg_replace_callback(
-            '#' . $base_pattern . '/([^\s"\'<>]+)#',
-            function ($matches) use ($synced_paths, $r2_url_with_prefix) {
-                $relative_path = $matches[1];
-
-                // Decode URL-encoded characters for comparison
-                $decoded_path = urldecode($relative_path);
-
-                if (isset($synced_paths[$relative_path]) || isset($synced_paths[$decoded_path])) {
-                    return $r2_url_with_prefix . '/' . $relative_path;
-                }
-
-                return $matches[0]; // Keep original URL for non-synced files
-            },
-            $content
-        );
-    }
-
-    /**
-     * Get all synced relative paths (main files + thumbnails + originals)
-     * Cached statically per request.
-     *
-     * @return array Associative array of relative paths (used as a set)
-     */
-    private function get_synced_paths(): array {
-        if (self::$synced_paths_cache !== null) {
-            return self::$synced_paths_cache;
-        }
-
-        // Try transient cache first
-        $cached = get_transient('numos_r2_synced_paths');
-        if ($cached !== false) {
-            self::$synced_paths_cache = $cached;
-            return self::$synced_paths_cache;
-        }
-
-        global $wpdb;
-
-        $results = $wpdb->get_results($wpdb->prepare(
-            "SELECT pm_file.meta_value as file_path, pm_meta.meta_value as metadata
-            FROM {$wpdb->postmeta} pm_status
-            INNER JOIN {$wpdb->postmeta} pm_file
-                ON pm_status.post_id = pm_file.post_id AND pm_file.meta_key = '_wp_attached_file'
-            LEFT JOIN {$wpdb->postmeta} pm_meta
-                ON pm_status.post_id = pm_meta.post_id AND pm_meta.meta_key = '_wp_attachment_metadata'
-            WHERE pm_status.meta_key = '_numos_r2_status'
-            AND pm_status.meta_value = %s",
-            'synced'
-        ));
-
-        $synced = [];
-
-        foreach ($results as $row) {
-            if (empty($row->file_path)) {
-                continue;
-            }
-
-            // Add main file
-            $synced[$row->file_path] = true;
-
-            // Add thumbnails and original from metadata
-            if (!empty($row->metadata)) {
-                $meta = maybe_unserialize($row->metadata);
-                $dir = dirname($row->file_path);
-                $dir_prefix = ($dir === '.') ? '' : $dir . '/';
-
-                if (!empty($meta['sizes']) && is_array($meta['sizes'])) {
-                    foreach ($meta['sizes'] as $size) {
-                        if (!empty($size['file'])) {
-                            $synced[$dir_prefix . $size['file']] = true;
-                        }
-                    }
-                }
-
-                if (!empty($meta['original_image'])) {
-                    $synced[$dir_prefix . $meta['original_image']] = true;
-                }
-            }
-        }
-
-        set_transient('numos_r2_synced_paths', $synced, 5 * MINUTE_IN_SECONDS);
-        self::$synced_paths_cache = $synced;
-        return self::$synced_paths_cache;
-    }
-
-    /**
-     * Rewrite ACF image field
-     *
-     * @param mixed $value Field value
-     * @param int $post_id Post ID
-     * @param array $field Field settings
-     * @return mixed
-     */
-    public function rewrite_acf_image($value, int $post_id, array $field) {
-        if (empty($value)) {
-            return $value;
-        }
-
-        // Check if R2 is available
-        if (!$this->r2_client->is_available()) {
-            return $value;
-        }
-
-        // Array format (image array)
-        if (is_array($value)) {
-            if (isset($value['url'])) {
-                $value['url'] = $this->maybe_rewrite_url($value['url'], $value['id'] ?? 0);
-            }
-            if (isset($value['sizes']) && is_array($value['sizes'])) {
-                foreach ($value['sizes'] as $size => &$url) {
-                    if (is_string($url)) {
-                        $url = $this->rewrite_local_to_r2($url);
-                    }
-                }
-            }
-        }
-        // String format (URL only)
-        elseif (is_string($value)) {
-            $value = $this->rewrite_local_to_r2($value);
-        }
-
-        return $value;
-    }
-
-    /**
-     * Rewrite ACF gallery field
-     *
-     * @param mixed $value Field value
-     * @param int $post_id Post ID
-     * @param array $field Field settings
-     * @return mixed
-     */
-    public function rewrite_acf_gallery($value, int $post_id, array $field) {
-        if (empty($value) || !is_array($value)) {
-            return $value;
-        }
-
-        foreach ($value as &$image) {
-            $image = $this->rewrite_acf_image($image, $post_id, $field);
-        }
-
-        return $value;
-    }
-
-    /**
-     * Rewrite ACF URL field
-     *
-     * @param mixed $value Field value
-     * @param int $post_id Post ID
-     * @param array $field Field settings
-     * @return mixed
-     */
-    public function rewrite_acf_url($value, int $post_id, array $field) {
-        if (empty($value) || !is_string($value)) {
-            return $value;
-        }
-
-        if (!$this->r2_client->is_available()) {
-            return $value;
-        }
-
-        return $this->rewrite_local_to_r2_if_synced($value);
-    }
-
-    /**
-     * Rewrite ACF file field
-     *
-     * @param mixed $value Field value
-     * @param int $post_id Post ID
-     * @param array $field Field settings
-     * @return mixed
-     */
-    public function rewrite_acf_file($value, int $post_id, array $field) {
-        if (empty($value)) {
-            return $value;
-        }
-
-        if (!$this->r2_client->is_available()) {
-            return $value;
-        }
-
-        if (is_array($value) && isset($value['url'])) {
-            $value['url'] = $this->rewrite_local_to_r2_if_synced($value['url']);
-        } elseif (is_string($value)) {
-            $value = $this->rewrite_local_to_r2_if_synced($value);
-        }
-
-        return $value;
-    }
-
-    /**
-     * Rewrite a local URL to R2 only if the file is in synced paths
-     *
-     * @param string $url URL to check
-     * @return string
-     */
-    private function rewrite_local_to_r2_if_synced(string $url): string {
-        if (strpos($url, $this->local_base_url) !== 0) {
-            return $url;
-        }
-
-        $relative_path = substr($url, strlen($this->local_base_url) + 1);
-        $synced_paths = $this->get_synced_paths();
-
-        if (isset($synced_paths[$relative_path]) || isset($synced_paths[urldecode($relative_path)])) {
-            return $this->r2_base_url . '/' . $this->prefix . '/' . $relative_path;
-        }
-
-        return $url;
-    }
-
-    /**
-     * Maybe rewrite a URL if the attachment is synced
-     *
-     * @param string $url URL to check
-     * @param int $attachment_id Attachment ID (optional)
-     * @return string
-     */
-    private function maybe_rewrite_url(string $url, int $attachment_id = 0): string {
-        // If we have an attachment ID, check if it's synced
-        if ($attachment_id > 0) {
-            $status = get_post_meta($attachment_id, '_numos_r2_status', true);
-            if ($status !== 'synced') {
-                return $url;
-            }
-        }
-
-        return $this->rewrite_local_to_r2($url);
-    }
-
-    /**
-     * Rewrite a local URL to R2
-     *
-     * @param string $url Local URL
-     * @return string R2 URL
-     */
-    private function rewrite_local_to_r2(string $url): string {
-        // Only rewrite if URL starts with our local uploads base (strict prefix match)
-        if (strpos($url, $this->local_base_url) !== 0) {
-            return $url;
-        }
-
-        // Replace the local base prefix with R2 URL + site prefix
-        $r2_url_with_prefix = $this->r2_base_url . '/' . $this->prefix;
-        return $r2_url_with_prefix . substr($url, strlen($this->local_base_url));
-    }
-
-    /**
-     * Start output buffer to rewrite all URLs in the final HTML
-     */
-    public function start_output_buffer(): void {
-        if (!$this->r2_client->is_available()) {
-            return;
-        }
-
-        ob_start([$this, 'rewrite_output_buffer']);
-    }
-
-    /**
-     * Rewrite local upload URLs in the final HTML/JSON output.
-     * Only rewrites URLs for files that are actually synced to R2.
-     * Handles both plain URLs and JSON-escaped URLs (with \/ slashes).
-     *
-     * @param string $output Full output (HTML or JSON)
-     * @return string Rewritten output
-     */
-    public function rewrite_output_buffer(string $output): string {
-        if (empty($output)) {
-            return $output;
-        }
-
-        $synced_paths = $this->get_synced_paths();
-        if (empty($synced_paths)) {
-            return $output;
-        }
-
-        $r2_url_with_prefix = $this->r2_base_url . '/' . $this->prefix;
-
-        // Pass 1: plain URLs (HTML, CSS, unescaped JSON)
-        $base_pattern = $this->build_base_pattern();
-        $output = preg_replace_callback(
-            '#' . $base_pattern . '/([^\s"\'<>\\\\]+)#',
-            function ($matches) use ($synced_paths, $r2_url_with_prefix) {
-                $relative_path = $matches[1];
-                $decoded_path = urldecode($relative_path);
-
-                if (isset($synced_paths[$relative_path]) || isset($synced_paths[$decoded_path])) {
-                    return $r2_url_with_prefix . '/' . $relative_path;
-                }
-
-                return $matches[0];
-            },
-            $output
-        );
-
-        // Pass 2: JSON-escaped URLs (slashes escaped as \/)
-        $json_base_pattern = $this->build_base_pattern(true);
-        $json_r2_prefix = str_replace('/', '\\/', $r2_url_with_prefix);
-
-        $output = preg_replace_callback(
-            '#' . $json_base_pattern . '((?:\\\\/[^\\s"\'<>&\\\\]+)+)#',
-            function ($matches) use ($synced_paths, $json_r2_prefix) {
-                // Unescape the path for lookup (capture includes leading \/)
-                $escaped_path = $matches[1];
-                $relative_path = str_replace('\\/', '/', ltrim($escaped_path, '\\/'));
-                $decoded_path = urldecode($relative_path);
-
-                if (isset($synced_paths[$relative_path]) || isset($synced_paths[$decoded_path])) {
-                    return $json_r2_prefix . $escaped_path;
-                }
-
-                return $matches[0];
-            },
-            $output
-        );
-
-        return $output;
-    }
-
 }

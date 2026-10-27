@@ -3,9 +3,6 @@ namespace NumosR2;
 
 defined('ABSPATH') || exit;
 
-/**
- * Migrator - Handles batch migration of existing media to R2
- */
 class Migrator {
 
     private R2Client $r2_client;
@@ -21,17 +18,12 @@ class Migrator {
     const LOCK_KEY = 'numos_r2_migration_lock';
     const PROGRESS_CACHE_TTL = 300; // 5 minutes
     const STATS_CACHE_TTL = 600; // 10 minutes
-    const LOCK_TTL = 120; // 2 minutes - auto-expire if process dies
+    const LOCK_TTL = 600; // must exceed one batch; a single PUT alone can run up to 280s
 
     public function __construct(R2Client $r2_client) {
         $this->r2_client = $r2_client;
     }
 
-    /**
-     * Get configured batch size
-     *
-     * @return int
-     */
     private function get_batch_size(): int {
         if ($this->cached_settings === null) {
             $this->cached_settings = get_option('numos_r2_settings', []);
@@ -41,30 +33,17 @@ class Migrator {
         return max(10, min(200, (int)$batch_size));
     }
 
-    /**
-     * Set media handler for uploads
-     */
     public function set_media_handler(MediaHandler $handler): void {
         $this->media_handler = $handler;
     }
 
-    /**
-     * Check if a migration is currently locked
-     *
-     * @return bool
-     */
     public function is_migration_locked(): bool {
         return (bool)get_transient(self::LOCK_KEY);
     }
 
-    /**
-     * Acquire migration lock
-     *
-     * @return bool True if lock acquired, false if already locked
-     */
     public function acquire_lock(): bool {
-        // Atomic: wp_cache_add returns false if key already exists (works with object caches)
-        // Fallback: check transient then set (TOCTOU acceptable for non-object-cache setups)
+        // wp_cache_add is atomic with a persistent object cache; the transient fallback has a
+        // check-then-set race, accepted without one.
         if (wp_using_ext_object_cache()) {
             if (!wp_cache_add(self::LOCK_KEY, time(), 'transient', self::LOCK_TTL)) {
                 return false;
@@ -80,45 +59,36 @@ class Migrator {
         return true;
     }
 
-    /**
-     * Extend migration lock (call during batch processing)
-     */
     public function extend_lock(): void {
         set_transient(self::LOCK_KEY, time(), self::LOCK_TTL);
     }
 
-    /**
-     * Release migration lock
-     */
     public function release_lock(): void {
         delete_transient(self::LOCK_KEY);
     }
 
-    /**
-     * Get total count of attachments that need migration
-     *
-     * @return int
-     */
     public function get_pending_count(): int {
         global $wpdb;
 
-        $count = $wpdb->get_var($wpdb->prepare("
-            SELECT COUNT(DISTINCT p.ID)
+        return (int) $wpdb->get_var('SELECT COUNT(DISTINCT p.ID) ' . $this->pending_clauses());
+    }
+
+    /**
+     * FROM and WHERE clauses selecting the attachments still to migrate: neither synced nor
+     * skipped.
+     */
+    private function pending_clauses(): string {
+        global $wpdb;
+
+        return $wpdb->prepare("
             FROM {$wpdb->posts} p
             LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_numos_r2_status'
             WHERE p.post_type = 'attachment'
             AND p.post_status = 'inherit'
             AND (pm.meta_value IS NULL OR pm.meta_value NOT IN (%s, %s))
-        ", 'synced', 'skipped'));
-
-        return (int)$count;
+        ", 'synced', 'skipped');
     }
 
-    /**
-     * Get total count of all attachments
-     *
-     * @return int
-     */
     public function get_total_count(): int {
         global $wpdb;
 
@@ -132,11 +102,6 @@ class Migrator {
         ", 'skipped'));
     }
 
-    /**
-     * Get count of synced attachments
-     *
-     * @return int
-     */
     public function get_synced_count(): int {
         global $wpdb;
 
@@ -153,44 +118,25 @@ class Migrator {
         return (int)$count;
     }
 
-    /**
-     * Get attachments that need migration
-     *
-     * @param int|null $batch_size Number of attachments to get (null = use setting)
-     * @param int $offset Offset for pagination
-     * @return array
-     */
     public function get_pending_attachments(?int $batch_size = null, int $offset = 0): array {
         $batch_size = $batch_size ?? $this->get_batch_size();
         global $wpdb;
 
-        $ids = $wpdb->get_col($wpdb->prepare("
-            SELECT DISTINCT p.ID
-            FROM {$wpdb->posts} p
-            LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_numos_r2_status'
-            WHERE p.post_type = 'attachment'
-            AND p.post_status = 'inherit'
-            AND (pm.meta_value IS NULL OR pm.meta_value NOT IN (%s, %s))
-            ORDER BY p.ID ASC
-            LIMIT %d OFFSET %d
-        ", 'synced', 'skipped', $batch_size, $offset));
+        $ids = $wpdb->get_col($wpdb->prepare(
+            'SELECT DISTINCT p.ID ' . $this->pending_clauses() . ' ORDER BY p.ID ASC LIMIT %d OFFSET %d',
+            $batch_size,
+            $offset
+        ));
 
         if (empty($ids)) {
             return [];
         }
 
-        // Prime meta cache to avoid N+1 queries in batch processing
         update_meta_cache('post', $ids);
 
         return array_map('get_post', $ids);
     }
 
-    /**
-     * Migrate a batch of attachments
-     *
-     * @param int|null $batch_size Number of attachments to migrate (null = use setting)
-     * @return array Migration result
-     */
     public function migrate_batch(?int $batch_size = null): array {
         $batch_size = $batch_size ?? $this->get_batch_size();
 
@@ -203,16 +149,13 @@ class Migrator {
             'done' => false,
         ];
 
-        // Check if R2 is available
         if (!$this->r2_client->is_available()) {
             $result['errors'][] = 'R2 is not available';
             return $result;
         }
 
-        // Extend lock for this batch
         $this->extend_lock();
 
-        // Get pending attachments
         $attachments = $this->get_pending_attachments($batch_size);
 
         if (empty($attachments)) {
@@ -222,25 +165,20 @@ class Migrator {
             return $result;
         }
 
-        // Ensure we have a media handler
         if (!$this->media_handler) {
             $this->media_handler = new MediaHandler($this->r2_client);
         }
 
-        // Collect all attachment IDs for batch upload
         $attachment_ids = array_map(function ($a) { return $a->ID; }, $attachments);
 
-        // Upload ALL attachments in one parallel batch
         $batch_results = $this->media_handler->upload_attachments_batch($attachment_ids);
 
-        // Process results
         foreach ($attachments as $attachment) {
             $result['processed']++;
             $aid = $attachment->ID;
             $ar = $batch_results[$aid] ?? null;
 
             if (!$ar) {
-                // Should not happen, but handle gracefully
                 $result['failed']++;
                 $result['errors'][] = "Attachment {$aid}: No result returned";
                 Logger::log('error', "No batch result for attachment {$aid}");
@@ -260,7 +198,6 @@ class Migrator {
                 $result['errors'][] = "Attachment {$aid}: {$error_msg}";
                 Logger::log('info', "Skipped attachment {$aid}: {$error_msg}");
             } else {
-                // partial or other failure
                 $result['failed']++;
                 $error_msg = $ar['error'] ?? 'Upload failed';
                 update_post_meta($aid, '_numos_r2_error', $error_msg);
@@ -271,19 +208,15 @@ class Migrator {
 
         }
 
-        // Update checkpoint once per batch (last processed ID)
         if (!empty($attachments)) {
             $last = end($attachments);
             $this->update_checkpoint($last->ID);
         }
 
-        // Update migration stats
         $this->update_stats($result);
 
-        // Invalidate progress cache after changes
         $this->invalidate_progress_cache();
 
-        // Check if we're done (force refresh to get accurate count)
         $remaining = $this->get_pending_count();
         $result['done'] = ($remaining === 0);
 
@@ -296,14 +229,7 @@ class Migrator {
         return $result;
     }
 
-    /**
-     * Get migration progress (cached)
-     *
-     * @param bool $force_refresh Force cache refresh
-     * @return array
-     */
     public function get_progress(bool $force_refresh = false): array {
-        // Try to get from cache first
         if (!$force_refresh) {
             $cached = get_transient(self::PROGRESS_CACHE_KEY);
             if ($cached !== false) {
@@ -323,24 +249,37 @@ class Migrator {
             'cached_at' => time(),
         ];
 
-        // Cache the result
         set_transient(self::PROGRESS_CACHE_KEY, $progress, self::PROGRESS_CACHE_TTL);
 
         return $progress;
     }
 
-    /**
-     * Invalidate progress cache (call after sync operations)
-     */
     public function invalidate_progress_cache(): void {
         delete_transient(self::PROGRESS_CACHE_KEY);
     }
 
     /**
-     * Get migration stats (with caching for synced size)
+     * Forget everything recorded about storage: every _numos_r2_ meta (manifests included),
+     * migration state and caches. Callers check first that no file only exists in storage.
      *
-     * @return array
+     * @return int Deleted meta rows
      */
+    public function purge_metadata(): int {
+        global $wpdb;
+        $deleted = (int) $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->postmeta} WHERE meta_key LIKE %s",
+            $wpdb->esc_like('_numos_r2_') . '%'
+        ));
+
+        delete_option('numos_r2_migration_checkpoint');
+        delete_option('numos_r2_migration_stats');
+        delete_transient('numos_r2_health_status');
+        delete_transient(self::STATS_CACHE_KEY);
+        UrlRewriter::forget_map();
+        $this->invalidate_progress_cache();
+        return $deleted;
+    }
+
     public function get_stats(): array {
         $stats = get_option(self::STATS_OPTION, [
             'total_processed' => 0,
@@ -352,7 +291,6 @@ class Migrator {
 
         $progress = $this->get_progress();
 
-        // Get cached synced size or calculate
         $cached_stats = get_transient(self::STATS_CACHE_KEY);
         if ($cached_stats !== false && isset($cached_stats['synced_size'])) {
             $synced_size = $cached_stats['synced_size'];
@@ -367,17 +305,11 @@ class Migrator {
         return array_merge($stats, $progress);
     }
 
-    /**
-     * Start a new migration
-     *
-     * @return bool True if started, false if already locked
-     */
     public function start_migration(): bool {
         if (!$this->acquire_lock()) {
             return false;
         }
 
-        // Reset stats
         update_option(self::STATS_OPTION, [
             'total_processed' => 0,
             'total_success' => 0,
@@ -386,7 +318,6 @@ class Migrator {
             'started_at' => time(),
         ]);
 
-        // Clear checkpoint
         delete_option(self::CHECKPOINT_OPTION);
 
         Logger::log('info', 'Migration started');
@@ -394,12 +325,13 @@ class Migrator {
     }
 
     /**
-     * Reset migration state (to retry failed items)
+     * Clear the status of failed, partial and skipped attachments so the next migration retries them.
+     *
+     * @return int Deleted meta rows
      */
     public function reset_failed(): int {
         global $wpdb;
 
-        // First, get the IDs of failed/partial/skipped items
         $failed_ids = $wpdb->get_col($wpdb->prepare("
             SELECT post_id FROM {$wpdb->postmeta}
             WHERE meta_key = '_numos_r2_status'
@@ -410,7 +342,7 @@ class Migrator {
             return 0;
         }
 
-        // Sanitize IDs and process in chunks to avoid max_allowed_packet overflow
+        // Chunks keep the IN () list under max_allowed_packet.
         $failed_ids = array_map('intval', $failed_ids);
         $count = 0;
 
@@ -424,7 +356,6 @@ class Migrator {
             ));
         }
 
-        // Invalidate cache after status changes
         $this->invalidate_progress_cache();
 
         Logger::log('info', "Reset {$count} failed items for retry");
@@ -432,12 +363,6 @@ class Migrator {
         return $count;
     }
 
-    /**
-     * Get failed attachments
-     *
-     * @param int $limit Number of items to get
-     * @return array
-     */
     public function get_failed_attachments(int $limit = 100): array {
         global $wpdb;
 
@@ -473,11 +398,6 @@ class Migrator {
         return $failed;
     }
 
-    /**
-     * Update checkpoint
-     *
-     * @param int $attachment_id Last processed attachment ID
-     */
     private function update_checkpoint(int $attachment_id): void {
         update_option(self::CHECKPOINT_OPTION, [
             'last_id' => $attachment_id,
@@ -485,18 +405,10 @@ class Migrator {
         ]);
     }
 
-    /**
-     * Get checkpoint
-     *
-     * @return array|null
-     */
     public function get_checkpoint(): ?array {
         return get_option(self::CHECKPOINT_OPTION, null);
     }
 
-    /**
-     * Clear migration state
-     */
     private function clear_migration_state(): void {
         delete_option(self::CHECKPOINT_OPTION);
 
@@ -504,7 +416,6 @@ class Migrator {
         $stats['completed_at'] = time();
         update_option(self::STATS_OPTION, $stats);
 
-        // Save last migration info for status band
         $duration = isset($stats['started_at']) ? (time() - $stats['started_at']) : 0;
         update_option(self::LAST_MIGRATION_OPTION, [
             'completed_at' => time(),
@@ -512,15 +423,9 @@ class Migrator {
             'duration' => $duration,
         ]);
 
-        // Invalidate stats cache
         delete_transient(self::STATS_CACHE_KEY);
     }
 
-    /**
-     * Update migration stats
-     *
-     * @param array $batch_result Batch result
-     */
     private function update_stats(array $batch_result): void {
         $stats = get_option(self::STATS_OPTION, [
             'total_processed' => 0,
@@ -537,11 +442,6 @@ class Migrator {
         update_option(self::STATS_OPTION, $stats);
     }
 
-    /**
-     * Calculate total size of synced files
-     *
-     * @return int Size in bytes
-     */
     public function calculate_synced_size(): int {
         global $wpdb;
 
@@ -579,7 +479,6 @@ class Migrator {
             if (file_exists($file)) {
                 $total_size += filesize($file);
 
-                // Add thumbnail sizes from metadata
                 if (!empty($row->attachment_metadata)) {
                     $metadata = maybe_unserialize($row->attachment_metadata);
                     if (!empty($metadata['sizes']) && is_array($metadata['sizes'])) {
@@ -599,10 +498,8 @@ class Migrator {
     }
 
     /**
-     * Get database orphans (attachment entries without physical files)
-     *
-     * @param int $limit Maximum number to return
-     * @return array
+     * Attachments neither synced nor skipped whose main file is missing locally, among the first
+     * $limit of them.
      */
     public function get_db_orphans(int $limit = 500): array {
         global $wpdb;
@@ -637,7 +534,6 @@ class Migrator {
                 ? $base_path . '/' . $attachment->attached_file
                 : null;
 
-            // Check if file exists
             if (!$file || !file_exists($file)) {
                 $orphans[] = [
                     'id' => $attachment->ID,
@@ -653,38 +549,12 @@ class Migrator {
     }
 
     /**
-     * Count database orphans (uses efficient COUNT query)
-     *
-     * @return int
+     * Exact up to 1000 attachments neither synced nor skipped, a lower bound beyond.
      */
     public function count_db_orphans(): int {
-        global $wpdb;
-
-        // Get total unsynchronized attachment count
-        $total_unsynced = $wpdb->get_var($wpdb->prepare("
-            SELECT COUNT(DISTINCT p.ID)
-            FROM {$wpdb->posts} p
-            LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id AND pm.meta_key = '_numos_r2_status'
-            WHERE p.post_type = 'attachment'
-            AND p.post_status = 'inherit'
-            AND (pm.meta_value IS NULL OR pm.meta_value NOT IN (%s, %s))
-        ", 'synced', 'skipped'));
-
-        // If few unsynced items, check each one (fast enough)
-        if ((int)$total_unsynced <= 500) {
-            return count($this->get_db_orphans(500));
-        }
-
-        // For large numbers, sample to estimate
         return count($this->get_db_orphans(1000));
     }
 
-    /**
-     * Delete database orphan entries
-     *
-     * @param array $ids Attachment IDs to delete
-     * @return array Result with deleted count and errors
-     */
     public function delete_db_orphans(array $ids): array {
         $deleted = 0;
         $errors = [];
@@ -692,14 +562,25 @@ class Migrator {
         foreach ($ids as $id) {
             $id = (int)$id;
 
-            // Verify it's actually an orphan (file doesn't exist)
+            // Must be an attachment, never anything else handed in via a forged request.
+            if (get_post_type($id) !== 'attachment') {
+                $errors[] = "Attachment {$id}: not an attachment, skipped";
+                continue;
+            }
+
             $file = get_attached_file($id);
             if ($file && file_exists($file)) {
                 $errors[] = "Attachment {$id}: File exists, skipped";
                 continue;
             }
 
-            // Delete the attachment (this also deletes meta)
+            // A missing local file is not an orphan when the media lives on R2: deleting the
+            // attachment would fire the R2 delete hook and destroy the only copy.
+            if (Manifest::has_trace($id)) {
+                $errors[] = "Attachment {$id}: offloaded to R2, not an orphan (restore or reconcile)";
+                continue;
+            }
+
             $result = wp_delete_attachment($id, true);
 
             if ($result) {
@@ -710,7 +591,6 @@ class Migrator {
             }
         }
 
-        // Invalidate cache after deleting entries
         $this->invalidate_progress_cache();
 
         Logger::log('info', "Cleaned {$deleted} orphan database entries");

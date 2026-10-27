@@ -3,9 +3,6 @@ namespace NumosR2;
 
 defined('ABSPATH') || exit;
 
-/**
- * WP-CLI Commands for Numos R2 Media Offload
- */
 class CLI {
 
     private R2Client $r2_client;
@@ -61,10 +58,10 @@ class CLI {
         \WP_CLI::log("Found {$pending} attachments to migrate.");
 
         if ($dry_run) {
-            \WP_CLI::log('Dry run — no files will be uploaded.');
+            \WP_CLI::log('Dry run: no files will be uploaded.');
             $attachments = $this->migrator->get_pending_attachments($pending);
             foreach ($attachments as $att) {
-                \WP_CLI::log("  Would migrate: #{$att->ID} — {$att->post_title}");
+                \WP_CLI::log("  Would migrate: #{$att->ID} - {$att->post_title}");
             }
             return;
         }
@@ -73,34 +70,8 @@ class CLI {
             \WP_CLI::error('A migration is already in progress. Wait or clear the lock.');
         }
 
-        $progress = \WP_CLI\Utils\make_progress_bar('Migrating media', $pending);
-        $total_success = 0;
-        $total_failed = 0;
-        $max_iterations = (int)ceil($pending / $batch_size) + 10;
-
-        for ($iteration = 0; $iteration < $max_iterations; $iteration++) {
-            $result = $this->migrator->migrate_batch($batch_size);
-
-            $total_success += $result['success'];
-            $total_failed += $result['failed'];
-
-            for ($i = 0; $i < $result['processed']; $i++) {
-                $progress->tick();
-            }
-
-            if (!empty($result['errors'])) {
-                foreach ($result['errors'] as $error) {
-                    \WP_CLI::warning($error);
-                }
-            }
-
-            if ($result['done'] || $result['processed'] === 0) {
-                break;
-            }
-        }
-
-        $progress->finish();
-        \WP_CLI::success("Migration complete: {$total_success} succeeded, {$total_failed} failed.");
+        $totals = $this->run_batches('Migrating media', $pending, $batch_size, [$this->migrator, 'migrate_batch'], ['success', 'failed']);
+        \WP_CLI::success("Migration complete: {$totals['success']} succeeded, {$totals['failed']} failed.");
     }
 
     /**
@@ -135,12 +106,12 @@ class CLI {
     }
 
     /**
-     * Verify synced files exist on R2 with correct sizes.
+     * Check that every file of each synced attachment is on R2 with the recorded size and content.
      *
      * ## OPTIONS
      *
      * [--fix]
-     * : Re-upload files that are missing or have wrong size on R2.
+     * : Re-upload the attachments found faulty. Media without a manifest are left to sync-from-r2.
      *
      * [--limit=<number>]
      * : Maximum number of attachments to verify.
@@ -199,7 +170,9 @@ class CLI {
                     \WP_CLI::warning("Attachment #{$id}: {$err}");
                 }
 
-                if ($fix) {
+                // Without a manifest the media predates manifests: sync-from-r2 rebuilds it from
+                // the existing objects, a re-upload would duplicate them under new keys.
+                if ($fix && Manifest::get($id) !== null) {
                     \WP_CLI::log("  Re-uploading attachment #{$id}...");
                     $upload = $this->media_handler->upload_attachment($id);
                     if ($upload['success']) {
@@ -251,7 +224,7 @@ class CLI {
         $dry_run = isset($assoc_args['dry-run']);
 
         if (!$this->r2_client->is_available()) {
-            \WP_CLI::error('R2 is not available — refusing to delete local files.');
+            \WP_CLI::error('R2 is not available; refusing to delete local files.');
         }
 
         $count = $this->local_cleaner->count_synced_with_local();
@@ -264,10 +237,10 @@ class CLI {
         \WP_CLI::log("Found {$count} synced attachments with local files.");
 
         if ($dry_run) {
-            \WP_CLI::log('Dry run — no files will be deleted.');
+            \WP_CLI::log('Dry run: no files will be deleted.');
             $ids = $this->local_cleaner->get_synced_with_local($count);
             foreach ($ids as $id) {
-                $files = $this->local_cleaner->get_attachment_files($id);
+                $files = Manifest::attachment_paths(get_attached_file($id), wp_get_attachment_metadata($id) ?: []);
                 $existing = array_filter($files, 'file_exists');
                 $size = array_sum(array_map('filesize', $existing));
                 \WP_CLI::log("  #{$id}: " . count($existing) . " files, " . size_format($size));
@@ -277,36 +250,8 @@ class CLI {
 
         \WP_CLI::confirm("Delete local files for {$count} synced attachments? Each will be verified on R2 first.", $assoc_args);
 
-        $progress = \WP_CLI\Utils\make_progress_bar('Deleting local files', $count);
-        $total_deleted = 0;
-        $total_freed = 0;
-        $total_errors = 0;
-        $max_iterations = (int)ceil($count / $batch_size) + 10;
-
-        for ($iteration = 0; $iteration < $max_iterations; $iteration++) {
-            $result = $this->local_cleaner->batch_delete_local($batch_size);
-
-            $total_deleted += $result['deleted'];
-            $total_freed += $result['freed_bytes'];
-            $total_errors += count($result['errors']);
-
-            for ($i = 0; $i < $result['processed']; $i++) {
-                $progress->tick();
-            }
-
-            if (!empty($result['errors'])) {
-                foreach ($result['errors'] as $err) {
-                    \WP_CLI::warning($err);
-                }
-            }
-
-            if ($result['done'] || $result['processed'] === 0) {
-                break;
-            }
-        }
-
-        $progress->finish();
-        \WP_CLI::success("Deleted local files for {$total_deleted} attachments, freed " . size_format($total_freed) . ". Errors: {$total_errors}.");
+        $totals = $this->run_batches('Deleting local files', $count, $batch_size, [$this->local_cleaner, 'batch_delete_local'], ['deleted', 'freed_bytes']);
+        \WP_CLI::success("Deleted local files for {$totals['deleted']} attachments, freed " . size_format($totals['freed_bytes']) . ". Errors: {$totals['errors']}.");
     }
 
     /**
@@ -341,7 +286,6 @@ class CLI {
             \WP_CLI::error('R2 is not available.');
         }
 
-        // Single attachment restore
         if ($attachment_id > 0) {
             \WP_CLI::log("Restoring attachment #{$attachment_id} from R2...");
             $result = $this->local_cleaner->restore_from_r2($attachment_id);
@@ -354,7 +298,6 @@ class CLI {
             return;
         }
 
-        // Batch restore all R2-only
         $r2_only = $this->local_cleaner->get_r2_only_attachments(10000);
         $count = count($r2_only);
 
@@ -365,34 +308,8 @@ class CLI {
 
         \WP_CLI::confirm("Restore {$count} attachments from R2 to local?", $assoc_args);
 
-        $progress = \WP_CLI\Utils\make_progress_bar('Restoring from R2', $count);
-        $total_restored = 0;
-        $total_errors = 0;
-        $max_iterations = (int)ceil($count / $batch_size) + 10;
-
-        for ($iteration = 0; $iteration < $max_iterations; $iteration++) {
-            $result = $this->local_cleaner->batch_restore_from_r2($batch_size);
-
-            $total_restored += $result['restored'];
-            $total_errors += count($result['errors']);
-
-            for ($i = 0; $i < $result['processed']; $i++) {
-                $progress->tick();
-            }
-
-            if (!empty($result['errors'])) {
-                foreach ($result['errors'] as $err) {
-                    \WP_CLI::warning($err);
-                }
-            }
-
-            if ($result['done'] || $result['processed'] === 0) {
-                break;
-            }
-        }
-
-        $progress->finish();
-        \WP_CLI::success("Restored {$total_restored} attachments. Errors: {$total_errors}.");
+        $totals = $this->run_batches('Restoring from R2', $count, $batch_size, [$this->local_cleaner, 'batch_restore_from_r2'], ['restored']);
+        \WP_CLI::success("Restored {$totals['restored']} attachments. Errors: {$totals['errors']}.");
     }
 
     /**
@@ -403,6 +320,9 @@ class CLI {
      * [--yes]
      * : Skip confirmation prompt.
      *
+     * [--force]
+     * : Delete even when some media have no local copy (R2 is their only source).
+     *
      * ## EXAMPLES
      *
      *     wp numos-r2 delete-r2 --yes
@@ -412,6 +332,15 @@ class CLI {
     public function delete_r2($args, $assoc_args) {
         if (!$this->r2_client->is_available()) {
             \WP_CLI::error('R2 is not available.');
+        }
+
+        // Same guard as the admin UI: R2-only media would be lost outright.
+        $savings = $this->local_cleaner->get_savings();
+        if ($savings['r2_only_count'] > 0 && !isset($assoc_args['force'])) {
+            \WP_CLI::error(sprintf(
+                '%d attachment(s) have no local copy; R2 is their only source. Restore them first, or pass --force.',
+                $savings['r2_only_count']
+            ));
         }
 
         $site_prefix = numos_r2_get_site_prefix();
@@ -446,31 +375,16 @@ class CLI {
             $token = $result['next_token'];
         } while ($result['is_truncated']);
 
-        // Purge metadata
-        global $wpdb;
-        $wpdb->query($wpdb->prepare(
-            "DELETE FROM {$wpdb->postmeta} WHERE meta_key LIKE %s",
-            $wpdb->esc_like('_numos_r2_') . '%'
-        ));
-
-        delete_option('numos_r2_migration_checkpoint');
-        delete_option('numos_r2_migration_stats');
-        delete_transient('numos_r2_health_status');
-        delete_transient('numos_r2_stats_cache');
-        delete_transient('numos_r2_migration_lock');
-        delete_transient('numos_r2_fully_synced');
-        delete_transient('numos_r2_progress_cache');
-        delete_transient('numos_r2_synced_paths');
+        $this->migrator->purge_metadata();
 
         \WP_CLI::success("Deleted {$total_deleted} objects from R2. All R2 metadata has been purged.");
     }
 
     /**
-     * Sync from R2: reconcile database with R2 bucket contents.
+     * Rebuild the manifest of media offloaded before manifests existed, from the objects on R2.
      *
-     * Scans R2 and marks attachments as synced if their files are found.
-     * Useful after a database restore when R2 files exist but the database
-     * has no R2 metadata.
+     * Only attachments that carry offload metadata and no manifest are considered. Each is
+     * marked synced when all its files are found, partial when some are missing.
      *
      * ## EXAMPLES
      *
@@ -509,8 +423,40 @@ class CLI {
     }
 
     /**
-     * Register WP-CLI commands
+     * Call $batch until it reports done or processes nothing, with a progress bar and every
+     * error printed. Batches start from the first remaining item, so an item that keeps
+     * failing comes back each time: the iteration bound is what ends that loop.
+     *
+     * @param callable $batch fn(int $batch_size): array{processed:int,errors:string[],done:bool}
+     * @param string[] $counters result fields to add up
+     * @return array<string,int> the summed counters, plus "errors"
      */
+    private function run_batches(string $label, int $count, int $batch_size, callable $batch, array $counters): array {
+        $progress = \WP_CLI\Utils\make_progress_bar($label, $count);
+        $totals = array_fill_keys($counters, 0) + ['errors' => 0];
+        $max_iterations = (int) ceil($count / $batch_size) + 10;
+
+        for ($iteration = 0; $iteration < $max_iterations; $iteration++) {
+            $result = $batch($batch_size);
+            foreach ($counters as $counter) {
+                $totals[$counter] += $result[$counter];
+            }
+            $totals['errors'] += count($result['errors']);
+            for ($i = 0; $i < $result['processed']; $i++) {
+                $progress->tick();
+            }
+            foreach ($result['errors'] as $error) {
+                \WP_CLI::warning($error);
+            }
+            if ($result['done'] || $result['processed'] === 0) {
+                break;
+            }
+        }
+
+        $progress->finish();
+        return $totals;
+    }
+
     public static function register(R2Client $r2_client, Migrator $migrator, MediaHandler $media_handler, LocalCleaner $local_cleaner): void {
         if (!defined('WP_CLI') || !WP_CLI) {
             return;
